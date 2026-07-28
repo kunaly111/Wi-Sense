@@ -1,0 +1,18 @@
+[
+    {
+        "merged": "com.wisense.resident.resident-app-debug-63:/mipmap-anydpi-v26_ic_launcher.xml.flat",
+        "source": "com.wisense.resident.resident-app-main-65:/mipmap-anydpi-v26/ic_launcher.xml"
+    },
+    {
+        "merged": "com.wisense.resident.resident-app-debug-63:/drawable_ic_notification.xml.flat",
+        "source": "com.wisense.resident.resident-app-main-65:/drawable/ic_notification.xml"
+    },
+    {
+        "merged": "com.wisense.resident.resident-app-debug-63:/drawable_ic_launcher_background.xml.flat",
+        "source": "com.wisense.resident.resident-app-main-65:/drawable/ic_launcher_background.xml"
+    },
+    {
+        "merged": "com.wisense.resident.resident-app-debug-63:/drawable_ic_launcher_foreground.xml.flat",
+        "source": "com.wisense.resident.resident-app-main-65:/drawable/ic_launcher_foreground.xml"
+    }
+]

@@ -1,3 +1,4 @@
+
 # Wi-Sense — Mobile & Cloud App Architecture
 
 **Status:** architecture handoff — no app code written yet. This is the starting brief for whoever builds the Resident and Caregiver Android apps.
