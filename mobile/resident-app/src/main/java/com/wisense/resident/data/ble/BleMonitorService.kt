@@ -12,7 +12,7 @@ import androidx.lifecycle.LifecycleService
 import com.wisense.resident.MainActivity
 import com.wisense.resident.R
 import com.wisense.resident.WiSenseResidentApp
-import com.wisense.resident.data.capture.EmergencyCaptureController
+import com.wisense.resident.data.emergency.EmergencyStreamController
 import com.wisense.resident.data.settings.SettingsStore
 import com.wisense.resident.domain.model.BleEvent
 import com.wisense.resident.domain.model.ConnectionState
@@ -29,10 +29,10 @@ import javax.inject.Inject
  * Foreground service that holds the BLE link to the RX board with the
  * screen off — the mechanism Android requires for reliable background BLE.
  *
- * It's a LifecycleService so CameraX can bind to its lifecycle and keep
- * running with the screen off. On ALERT it escalates the foreground-service
- * type to camera+microphone (required since Android 14) and starts capture;
- * on CANCEL it stops capture and drops back to the connectedDevice type.
+ * On ALERT it escalates the foreground-service type to camera+microphone
+ * (required since Android 14) and starts capture+streaming via
+ * [EmergencyStreamController]; on CANCEL it stops and drops back to the
+ * connectedDevice type.
  */
 @AndroidEntryPoint
 class BleMonitorService : LifecycleService() {
@@ -44,11 +44,8 @@ class BleMonitorService : LifecycleService() {
     lateinit var settingsStore: SettingsStore
 
     @Inject
-    lateinit var captureController: EmergencyCaptureController
+    lateinit var emergencyStreamController: EmergencyStreamController
 
-    // Main, not Default: handleTriggerEvent() calls into EmergencyCaptureController,
-    // which drives CameraX's ProcessCameraProvider — main-thread-only, or
-    // bindToLifecycle()/unbindAll() throw IllegalStateException.
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
 
     override fun onBind(intent: Intent): IBinder? {
@@ -80,7 +77,7 @@ class BleMonitorService : LifecycleService() {
     }
 
     override fun onDestroy() {
-        captureController.stop()
+        emergencyStreamController.stop()
         bleRepository.stopMonitoring()
         scope.cancel()
         super.onDestroy()
@@ -97,19 +94,19 @@ class BleMonitorService : LifecycleService() {
     }
 
     private fun startEmergency() {
-        if (captureController.session.value.active) return
+        if (emergencyStreamController.active) return
         // Escalate foreground-service type to camera+mic BEFORE using them —
         // required for a backgrounded app since Android 14.
         startForegroundWithNotification(
             getString(R.string.monitor_notification_emergency),
             inEmergency = true,
         )
-        captureController.start(lifecycleOwner = this)
+        emergencyStreamController.start()
     }
 
     private fun stopEmergency() {
-        if (!captureController.session.value.active) return
-        captureController.stop()
+        if (!emergencyStreamController.active) return
+        emergencyStreamController.stop()
         // Drop back to the lightweight connectedDevice type.
         startForegroundWithNotification(
             bleRepository.connectionState.value.notificationText(),
@@ -145,7 +142,7 @@ class BleMonitorService : LifecycleService() {
 
     private fun updateNotification(text: String) {
         if (!settingsStore.showMonitorNotification.value) return
-        if (captureController.session.value.active) return // emergency text owns it
+        if (emergencyStreamController.active) return // emergency text owns it
         val manager = getSystemService(NOTIFICATION_SERVICE) as android.app.NotificationManager
         manager.notify(NOTIFICATION_ID, buildNotification(text))
     }

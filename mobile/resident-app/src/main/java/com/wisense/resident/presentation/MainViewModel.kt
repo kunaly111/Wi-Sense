@@ -7,14 +7,13 @@ import android.os.Build
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
-import androidx.camera.view.PreviewView
 import com.wisense.resident.data.ble.BleMonitorService
 import com.wisense.resident.data.ble.BleRepository
-import com.wisense.resident.data.capture.EmergencyCaptureController
+import com.wisense.resident.data.emergency.EmergencyStreamController
+import com.wisense.resident.data.emergency.EmergencyStreamState
 import com.wisense.resident.data.settings.SettingsStore
 import com.wisense.resident.domain.model.BleEvent
 import com.wisense.resident.domain.model.ConnectionState
-import com.wisense.resident.domain.model.EmergencySession
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -33,17 +32,20 @@ import javax.inject.Inject
 class MainViewModel @Inject constructor(
     private val bleRepository: BleRepository,
     private val settingsStore: SettingsStore,
-    private val captureController: EmergencyCaptureController,
+    private val emergencyStreamController: EmergencyStreamController,
     @ApplicationContext private val context: Context,
 ) : ViewModel() {
 
     val connectionState: StateFlow<ConnectionState> = bleRepository.connectionState
 
     /** Active emergency session (inactive when idle) — drives the Emergency screen. */
-    val emergencySession: StateFlow<EmergencySession> = captureController.session
+    val emergencyState: StateFlow<EmergencyStreamState> = emergencyStreamController.state
 
-    /** The camera preview view the Active Emergency screen renders. */
-    val previewView: PreviewView = captureController.previewView
+    /** The local camera track the Active Emergency screen renders. */
+    val localVideoTrack = emergencyStreamController.localVideoTrack
+    val eglBaseContext get() = emergencyStreamController.eglBaseContext
+    val signalingPort get() = emergencyStreamController.signalingPort
+    fun localIpAddress(): String? = emergencyStreamController.localIpAddress()
 
     /** Rolling log, newest first, capped so a long-running session stays bounded. */
     val eventLog: StateFlow<List<BleEvent>> = bleRepository.events

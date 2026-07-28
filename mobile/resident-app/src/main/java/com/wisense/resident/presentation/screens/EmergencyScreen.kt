@@ -1,6 +1,5 @@
 package com.wisense.resident.presentation.screens
 
-import android.view.ViewGroup
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -14,6 +13,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -28,9 +28,13 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import com.wisense.resident.domain.model.EmergencySession
+import com.wisense.resident.data.emergency.EmergencyStreamState
 import com.wisense.resident.presentation.MainViewModel
 import kotlinx.coroutines.delay
+import org.webrtc.EglBase
+import org.webrtc.RendererCommon
+import org.webrtc.SurfaceViewRenderer
+import org.webrtc.VideoTrack
 
 /**
  * §8 Active Emergency screen. Shown the instant ALERT is received. Local
@@ -42,7 +46,8 @@ import kotlinx.coroutines.delay
  */
 @Composable
 fun EmergencyScreen(viewModel: MainViewModel) {
-    val session by viewModel.emergencySession.collectAsStateWithLifecycle()
+    val state by viewModel.emergencyState.collectAsStateWithLifecycle()
+    val active = state as? EmergencyStreamState.Active
 
     Column(
         modifier = Modifier
@@ -59,13 +64,17 @@ fun EmergencyScreen(viewModel: MainViewModel) {
         )
         Spacer(Modifier.height(4.dp))
         Text(
-            text = "Caregiver has been notified",
+            text = if (active?.caregiverConnected == true) {
+                "Caregiver connected and watching live"
+            } else {
+                "Waiting for a caregiver to connect…"
+            },
             style = MaterialTheme.typography.bodyLarge,
             color = Color(0xFFFFDAD6),
         )
 
         Spacer(Modifier.height(16.dp))
-        ElapsedTimer(startedAtMillis = session.startedAtMillis)
+        ElapsedTimer(startedAtMillis = active?.startedAtMillis ?: 0L)
         Spacer(Modifier.height(16.dp))
 
         // §7: proceed with whatever is available; camera out → explicit fallback.
@@ -74,14 +83,25 @@ fun EmergencyScreen(viewModel: MainViewModel) {
                 .fillMaxWidth()
                 .weight(1f),
         ) {
-            if (session.cameraAvailable) {
-                CameraPreview(viewModel)
+            val videoTrack by viewModel.localVideoTrack.collectAsStateWithLifecycle()
+            val eglContext = viewModel.eglBaseContext
+            if (active?.cameraAvailable == true && videoTrack != null && eglContext != null) {
+                CameraPreview(track = videoTrack!!, eglBaseContext = eglContext)
             } else {
-                CameraUnavailableFallback(micAvailable = session.micAvailable)
+                CameraUnavailableFallback(micAvailable = active?.micAvailable ?: false)
             }
         }
 
         Spacer(Modifier.height(16.dp))
+        // Interim, until Phase 4 (Firestore) removes the need for this: a
+        // caregiver has to manually type this address into the caregiver app.
+        Text(
+            text = "Caregiver app: connect to ${viewModel.localIpAddress() ?: "unknown"}:${viewModel.signalingPort}",
+            style = MaterialTheme.typography.bodySmall,
+            color = Color(0xFFFFDAD6),
+            textAlign = TextAlign.Center,
+        )
+        Spacer(Modifier.height(8.dp))
         Text(
             text = "Press the button on the room sensor to cancel.",
             style = MaterialTheme.typography.bodyMedium,
@@ -119,7 +139,15 @@ private fun rememberElapsedSeconds(startedAtMillis: Long): Long {
 }
 
 @Composable
-private fun CameraPreview(viewModel: MainViewModel) {
+private fun CameraPreview(track: VideoTrack, eglBaseContext: EglBase.Context) {
+    var attachedRenderer by remember { mutableStateOf<SurfaceViewRenderer?>(null) }
+
+    DisposableEffect(track) {
+        onDispose {
+            attachedRenderer?.let { track.removeSink(it) }
+        }
+    }
+
     Box(
         modifier = Modifier
             .fillMaxSize()
@@ -127,15 +155,15 @@ private fun CameraPreview(viewModel: MainViewModel) {
             .background(Color.Black),
     ) {
         AndroidView(
-            factory = {
-                // previewView is a singleton (survives config changes so the camera
-                // binding isn't lost on rotation) — but that means it can still be
-                // attached to a now-destroyed composition's parent (e.g. after the
-                // Activity is torn down and recreated on screen lock). Compose's
-                // AndroidView throws "child already has a parent" otherwise.
-                val preview = viewModel.previewView
-                (preview.parent as? ViewGroup)?.removeView(preview)
-                preview
+            factory = { ctx ->
+                SurfaceViewRenderer(ctx).apply {
+                    init(eglBaseContext, null)
+                    setScalingType(RendererCommon.ScalingType.SCALE_ASPECT_FIT)
+                    setEnableHardwareScaler(true)
+                    setMirror(true)
+                    track.addSink(this)
+                    attachedRenderer = this
+                }
             },
             modifier = Modifier.fillMaxSize(),
         )

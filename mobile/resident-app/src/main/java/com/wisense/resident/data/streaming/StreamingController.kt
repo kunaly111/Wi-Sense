@@ -27,9 +27,9 @@ import java.util.Collections
  * Resident is always the offerer/server here; Phase 4 replaces
  * [SignalingServer] with Firestore without touching WebRtcClient itself.
  *
- * NOT wired into the real BLE ALERT flow yet — that integration (this
- * controller vs. EmergencyCaptureController's CameraX capture) is later
- * roadmap work. This is a standalone test screen only.
+ * Standalone test screen, separate from EmergencyStreamController (which
+ * drives the real BLE ALERT flow) — kept around so the media path can still
+ * be exercised without triggering real hardware.
  */
 sealed interface StreamTestState {
     data object Idle : StreamTestState

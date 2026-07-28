@@ -5,7 +5,7 @@ import android.content.Context
 import com.wisense.resident.data.ble.BleConnectionManager
 import com.wisense.resident.data.ble.BleRepository
 import com.wisense.resident.data.ble.BleRepositoryImpl
-import com.wisense.resident.data.capture.EmergencyCaptureController
+import com.wisense.resident.data.emergency.EmergencyStreamController
 import com.wisense.resident.data.streaming.StreamingController
 import dagger.Binds
 import dagger.Module
@@ -42,9 +42,9 @@ object AppModule {
 
     @Provides
     @Singleton
-    fun provideEmergencyCaptureController(
+    fun provideEmergencyStreamController(
         @ApplicationContext context: Context,
-    ): EmergencyCaptureController = EmergencyCaptureController(context)
+    ): EmergencyStreamController = EmergencyStreamController(context)
 
     @Provides
     @Singleton

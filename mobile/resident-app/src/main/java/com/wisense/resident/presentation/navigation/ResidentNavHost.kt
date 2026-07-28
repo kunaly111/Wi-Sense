@@ -7,6 +7,7 @@ import androidx.navigation.NavHostController
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
+import com.wisense.resident.data.emergency.EmergencyStreamState
 import com.wisense.resident.presentation.MainViewModel
 import com.wisense.resident.presentation.screens.EmergencyScreen
 import com.wisense.resident.presentation.screens.IdleScreen
@@ -30,8 +31,8 @@ fun ResidentNavHost() {
     // ALERT → Emergency screen; CANCEL → back to Idle. Driven by the service's
     // capture session so it works even when the app was backgrounded.
     LaunchedEffect(Unit) {
-        viewModel.emergencySession.collect { session ->
-            if (session.active) {
+        viewModel.emergencyState.collect { state ->
+            if (state is EmergencyStreamState.Active) {
                 navController.navigateToEmergency()
             } else {
                 navController.exitEmergency()
