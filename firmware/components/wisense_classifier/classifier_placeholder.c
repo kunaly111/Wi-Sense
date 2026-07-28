@@ -1,10 +1,18 @@
 /*
- * Placeholder classifier: maps UART keypresses to prediction classes.
+ * Placeholder classifier: maps keypresses to prediction classes.
  *
  *   e / E -> Empty
  *   p / P -> Presence
  *   m / M -> Motion
  *   f / F -> Fall
+ *
+ * Reads from whichever peripheral is the board's actual console: a UART
+ * (most boards — an external USB-UART bridge on the console UART pins) or,
+ * when CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG is set (e.g. ESP32-S3-DevKitC-1,
+ * where UART0's pins aren't wired to anything and only the native
+ * USB-Serial/JTAG peripheral reaches the PC), that peripheral instead.
+ * idf.py monitor's keyboard passthrough only reaches whichever peripheral
+ * is actually configured as the primary console.
  *
  * When TinyML is ready, replace this file (via Kconfig) without changing
  * OLED, relay, or other automation modules.
@@ -19,6 +27,8 @@
 
 #include "driver/uart.h"
 #include "driver/uart_vfs.h"
+#include "driver/usb_serial_jtag.h"
+#include "driver/usb_serial_jtag_vfs.h"
 #include "esp_log.h"
 #include "sdkconfig.h"
 
@@ -134,15 +144,19 @@ static esp_err_t placeholder_set_on_change(wisense_classifier_on_change_cb_t cb,
     return ESP_OK;
 }
 
-static void uart_reader_task(void *arg)
+static void key_reader_task(void *arg)
 {
     (void)arg;
 
-    ESP_LOGI(TAG, "UART reader ready — type e/p/m/f (Empty/Presence/Motion/Fall)");
+    ESP_LOGI(TAG, "Key reader ready — type e/p/m/f (Empty/Presence/Motion/Fall)");
 
     while (true) {
         uint8_t byte = 0;
+#if CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG
+        int n = usb_serial_jtag_read_bytes(&byte, 1, pdMS_TO_TICKS(200));
+#else
         int n = uart_read_bytes(CONFIG_WISENSE_CLASSIFIER_UART_NUM, &byte, 1, pdMS_TO_TICKS(200));
+#endif
         if (n <= 0) {
             continue;
         }
@@ -178,6 +192,25 @@ static esp_err_t placeholder_init(void)
     s_on_change_ctx = NULL;
     s_started = false;
 
+#if CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG
+    /*
+     * Board's console is the native USB-Serial/JTAG peripheral (no external
+     * USB-UART bridge on UART0) — read keys from that peripheral instead.
+     */
+    usb_serial_jtag_driver_config_t usj_cfg = USB_SERIAL_JTAG_DRIVER_CONFIG_DEFAULT();
+    esp_err_t err = usb_serial_jtag_driver_install(&usj_cfg);
+    if (err == ESP_ERR_INVALID_STATE) {
+        /* Already installed by console — continue. */
+        err = ESP_OK;
+    }
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "usb_serial_jtag_driver_install failed: %s", esp_err_to_name(err));
+        return err;
+    }
+    usb_serial_jtag_vfs_use_driver();
+
+    ESP_LOGI(TAG, "Placeholder classifier init (USB-Serial/JTAG, default=Empty)");
+#else
     /*
      * Install the UART driver on the console port so we can read keys with
      * uart_read_bytes. Wire VFS stdin to the same driver for ESP_LOG / printf.
@@ -213,6 +246,7 @@ static esp_err_t placeholder_init(void)
 
     ESP_LOGI(TAG, "Placeholder classifier init (UART%d @ %d baud, default=Empty)",
              uart_num, CONFIG_WISENSE_CLASSIFIER_UART_BAUD);
+#endif
     return ESP_OK;
 }
 
@@ -225,7 +259,12 @@ static esp_err_t placeholder_start(void)
         return ESP_OK;
     }
 
-    BaseType_t ok = xTaskCreate(uart_reader_task, "clf_uart", 3072, NULL, 5, NULL);
+    /*
+     * 6144 bytes: a keypress synchronously chains through the on-change
+     * callback into OLED (I2C) + esp_timer + buzzer/servo calls, all on
+     * this task's own stack — 3072 was measured to overflow that chain.
+     */
+    BaseType_t ok = xTaskCreate(key_reader_task, "clf_key", 6144, NULL, 5, NULL);
     if (ok != pdPASS) {
         return ESP_ERR_NO_MEM;
     }

@@ -20,7 +20,14 @@ extern "C" {
  */
 esp_err_t wisense_fsr_init(int gpio);
 
-/** True when raw ADC reading meets or exceeds the press threshold. */
+/**
+ * @brief Debounced/hysteresis pressure state.
+ *
+ * Backed by a smoothed (moving-average) reading and a two-threshold
+ * Schmitt trigger: enters "pressed" only at/above PRESS_THRESHOLD, exits
+ * only at/below RELEASE_THRESHOLD, so a reading sitting near the boundary
+ * doesn't chatter.
+ */
 bool wisense_fsr_is_pressed(void);
 
 /** Latest raw ADC sample (0..4095 on 12-bit). */

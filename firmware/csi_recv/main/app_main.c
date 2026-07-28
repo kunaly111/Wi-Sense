@@ -28,6 +28,13 @@
 
 #include "csi_binary_proto.h"
 
+#include "wisense_classifier.h"
+#include "wisense_fsr.h"
+#include "wisense_light.h"
+#include "wisense_oled.h"
+
+#include "emergency_rx.h"
+
 _Static_assert(sizeof(csi_binary_header_t) == 4, "csi_binary_header_t size mismatch");
 _Static_assert(sizeof(csi_binary_legacy_payload_t) == 804, "csi_binary_legacy_payload_t size mismatch");
 _Static_assert(sizeof(csi_binary_c5c6_payload_t) == 794, "csi_binary_c5c6_payload_t size mismatch");
@@ -289,7 +296,15 @@ static void wifi_csi_rx_cb(void *ctx, wifi_csi_info_t *info)
     ESP_LOGD(TAG, "compensate_gain %f, agc_gain %d, fft_gain %d", compensate_gain, agc_gain, fft_gain);
 #endif
 
-    uint32_t rx_id = *(uint32_t *)(info->payload + 15);
+    /*
+     * The sender's ESP-NOW payload is a uint32_t sequence counter.  In a CSI
+     * callback, the 802.11 MAC header occupies the first 15 bytes of payload.
+     * Copy rather than cast so this remains safe on targets that require
+     * aligned uint32_t accesses.
+     */
+    uint32_t rx_id;
+    memcpy(&rx_id, info->payload + 15, sizeof(rx_id));
+
     if (!s_count) {
         ESP_LOGI(TAG, "================ CSI RECV (binary) ================");
     }
@@ -355,6 +370,26 @@ static void wifi_csi_init()
     ESP_ERROR_CHECK(esp_wifi_set_csi(true));
 }
 
+static void on_class_changed(wisense_class_t new_class, void *ctx)
+{
+    (void)ctx;
+
+    bool skip_class_oled = false;
+    ESP_ERROR_CHECK(emergency_rx_on_class_change(new_class, &skip_class_oled));
+
+    if (!skip_class_oled) {
+        esp_err_t err = wisense_oled_show_class(new_class);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "OLED update failed: %s", esp_err_to_name(err));
+        }
+    }
+
+    esp_err_t err = wisense_light_on_class_change(new_class);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Light automation failed: %s", esp_err_to_name(err));
+    }
+}
+
 void app_main()
 {
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -389,4 +424,24 @@ void app_main()
     wifi_esp_now_init(peer);
 
     wifi_csi_init();
+
+    /*
+     * Hardware peripheral stack — OLED, relay/LDR, FSR, fall emergency
+     * (servo + BLE phone trigger), placeholder classifier. Merged onto the
+     * real ESP32-S3 RX target now rather than waiting for TinyML; see
+     * docs/handoff.md for the two-board architecture (this board owns
+     * every peripheral, the TX board only ever sends CSI).
+     */
+    ESP_ERROR_CHECK(wisense_oled_init(-1, -1));
+    ESP_ERROR_CHECK(wisense_oled_show_class(WISENSE_CLASS_EMPTY));
+    ESP_ERROR_CHECK(wisense_light_init(-1, -1));
+    ESP_ERROR_CHECK(wisense_fsr_init(-1));
+    ESP_ERROR_CHECK(emergency_rx_init());
+
+    const wisense_classifier_ops_t *clf = wisense_classifier_get();
+    ESP_ERROR_CHECK(clf->init());
+    ESP_ERROR_CHECK(clf->set_on_change(on_class_changed, NULL));
+    ESP_ERROR_CHECK(clf->start());
+
+    ESP_LOGI(TAG, "Hardware peripherals ready. Type e/p/m/f in the serial monitor to change class.");
 }

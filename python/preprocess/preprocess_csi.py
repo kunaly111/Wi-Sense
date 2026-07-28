@@ -86,12 +86,15 @@ HOP_FALL = 0.1
 
 DEFAULT_FALL_OFFSET_SEC = 10.0
 DEFAULT_FALL_WINDOW_SEC = 3.0
-# Repeat live empty captures in the train file list (same windows, higher weight).
-LIVE_EMPTY_TRAIN_REPEAT = 40
 
 TARGET_SEQ_1S = 90
 TARGET_SEQ_2S = 180
 FEATURE_DIM = NUM_SUBCARRIERS * 2 + 5 + 6  # mean_sc + std_sc + stats + band stats
+
+# ESP-IDF CSI local_timestamp is a wrapping uint32 microsecond counter.
+CSI_TIMESTAMP_WRAP_US = 1 << 32
+MIN_TIMESTAMP_DURATION_SEC = 1.0
+MAX_TIMESTAMP_DURATION_SEC = 300.0
 
 BASELINE_MODE_PER_FILE = 'per_file'
 BASELINE_MODE_EMPTY_REF = 'empty_room_reference'
@@ -194,6 +197,9 @@ MIN_FILE_PACKETS = 80
 MAX_WINDOW_DELTA = 500.0
 MAX_WINDOW_ABS = 800.0
 MAX_NORM_PKT_ABS = 600.0
+# Windows may bridge one or two lost packets, but larger ID gaps represent a
+# real time discontinuity and are excluded from training.
+MAX_MISSING_PACKETS_PER_WINDOW_GAP = 2
 
 
 def has_parse_artifact(amplitude):
@@ -232,14 +238,14 @@ def is_outlier(amplitude, median_ref, mad_ref, z_threshold=MAD_Z_THRESHOLD, abs_
     return is_mad_outlier(amplitude, median_ref, mad_ref, z_threshold, abs_cap)
 
 
-def filter_amplitude_matrix(matrix):
+def filter_amplitude_matrix(matrix, return_indices=False):
     """Two-pass packet filter: spikes, then MAD; drop large packet-to-packet jumps.
 
     Returns (filtered_matrix, stats_dict).
     """
     matrix = np.asarray(matrix, dtype=np.float32)
     if matrix.size == 0:
-        return matrix, {
+        stats = {
             'raw_packets': 0,
             'kept_packets': 0,
             'drop_pct': 0.0,
@@ -248,19 +254,25 @@ def filter_amplitude_matrix(matrix):
             'drop_mad': 0,
             'drop_jump': 0,
         }
+        if return_indices:
+            return matrix, stats, np.zeros(0, dtype=np.int32)
+        return matrix, stats
 
     n_raw = matrix.shape[0]
     drop_spike = drop_mad = drop_jump = 0
     prev_mean = None
     pass1 = []
+    pass1_indices = []
     for i in range(n_raw):
         pkt = matrix[i]
         if is_spike_packet(pkt):
             drop_spike += 1
             continue
         pass1.append(pkt)
+        pass1_indices.append(i)
     if not pass1:
-        return np.zeros((0, NUM_SUBCARRIERS), dtype=np.float32), {
+        filtered = np.zeros((0, NUM_SUBCARRIERS), dtype=np.float32)
+        stats = {
             'raw_packets': n_raw,
             'kept_packets': 0,
             'drop_pct': 100.0,
@@ -268,13 +280,18 @@ def filter_amplitude_matrix(matrix):
             'drop_mad': 0,
             'drop_jump': 0,
         }
+        if return_indices:
+            return filtered, stats, np.zeros(0, dtype=np.int32)
+        return filtered, stats
 
     pass1 = np.stack(pass1, axis=0)
+    pass1_indices = np.asarray(pass1_indices, dtype=np.int32)
     per_pkt_mean = pass1.mean(axis=1)
     median_ref = float(np.median(per_pkt_mean))
     mad_ref = float(np.median(np.abs(per_pkt_mean - median_ref)))
 
     kept = []
+    kept_indices = []
     prev_mean = None
     for i in range(pass1.shape[0]):
         pkt = pass1[i]
@@ -289,6 +306,7 @@ def filter_amplitude_matrix(matrix):
                 continue
         prev_mean = cur_mean
         kept.append(pkt)
+        kept_indices.append(pass1_indices[i])
 
     if not kept:
         filtered = np.zeros((0, NUM_SUBCARRIERS), dtype=np.float32)
@@ -297,7 +315,7 @@ def filter_amplitude_matrix(matrix):
 
     n_kept = filtered.shape[0]
     drop_total = n_raw - n_kept
-    return filtered, {
+    stats = {
         'raw_packets': n_raw,
         'kept_packets': n_kept,
         'drop_pct': round(100.0 * drop_total / max(n_raw, 1), 2),
@@ -305,17 +323,26 @@ def filter_amplitude_matrix(matrix):
         'drop_mad': drop_mad,
         'drop_jump': drop_jump,
     }
+    if return_indices:
+        return filtered, stats, np.asarray(kept_indices, dtype=np.int32)
+    return filtered, stats
 
 
-def filter_normalized_matrix(matrix, max_abs=MAX_NORM_PKT_ABS):
+def filter_normalized_matrix(matrix, max_abs=MAX_NORM_PKT_ABS, return_mask=False):
     """Drop baseline-subtracted packets with residual amplitude spikes."""
     matrix = np.asarray(matrix, dtype=np.float32)
     if matrix.size == 0:
-        return matrix, {'drop_norm_spike': 0}
+        stats = {'drop_norm_spike': 0}
+        if return_mask:
+            return matrix, stats, np.zeros(0, dtype=bool)
+        return matrix, stats
     per_max = np.max(np.abs(matrix), axis=1)
     keep = per_max <= max_abs
     filtered = matrix[keep]
-    return filtered, {'drop_norm_spike': int((~keep).sum())}
+    stats = {'drop_norm_spike': int((~keep).sum())}
+    if return_mask:
+        return filtered, stats, keep
+    return filtered, stats
 
 
 def is_valid_window(window):
@@ -332,9 +359,35 @@ def is_valid_window(window):
     return True
 
 
-def load_csv_packets(csv_path, expected_mac=EXPECTED_MAC, return_stats=False):
+def sequence_gap_stats(packet_ids):
+    """Return capture-level loss statistics from consecutive transmitter IDs."""
+    ids = np.asarray(packet_ids, dtype=np.int64)
+    if ids.size < 2:
+        return {
+            'sequence_gaps': 0,
+            'sequence_missing': 0,
+            'sequence_large_gaps': 0,
+        }
+    deltas = np.diff(ids)
+    return {
+        'sequence_gaps': int(np.sum(deltas > 1)),
+        'sequence_missing': int(np.sum(np.maximum(deltas - 1, 0))),
+        'sequence_large_gaps': int(
+            np.sum(deltas > MAX_MISSING_PACKETS_PER_WINDOW_GAP + 1)
+        ),
+    }
+
+
+def load_csv_packets(csv_path, expected_mac=EXPECTED_MAC, return_stats=False,
+                     return_packet_ids=False):
     """Load one capture CSV into raw (N, NUM_SUBCARRIERS) amplitudes with outlier rejection."""
     packets = []
+    packet_ids = []
+    raw_packet_timestamps = []
+    packet_segments = []
+    raw_packet_ids = []
+    segment_id = 0
+    previous_packet_id = None
     drop_corrupt = 0
     drop_parse = 0
     raw_packets = 0
@@ -351,7 +404,23 @@ def load_csv_packets(csv_path, expected_mac=EXPECTED_MAC, return_stats=False):
                 continue
             if length != EXPECTED_LEN:
                 continue
+            try:
+                packet_id = int(row['id'])
+            except (KeyError, TypeError, ValueError):
+                # Keep older captures processable even if they lack a sequence ID.
+                packet_id = raw_packets
             raw_packets += 1
+            raw_packet_ids.append(packet_id)
+            try:
+                timestamp = int(row.get('local_timestamp', ''))
+            except (TypeError, ValueError):
+                timestamp = None
+            raw_packet_timestamps.append(timestamp)
+            if (previous_packet_id is not None
+                    and packet_id - previous_packet_id
+                    > MAX_MISSING_PACKETS_PER_WINDOW_GAP + 1):
+                segment_id += 1
+            previous_packet_id = packet_id
             i_vals, q_vals = parse_csi_iq(row['data'], expected_len=length)
             if i_vals is None:
                 drop_parse += 1
@@ -364,6 +433,8 @@ def load_csv_packets(csv_path, expected_mac=EXPECTED_MAC, return_stats=False):
                 drop_corrupt += 1
                 continue
             packets.append(amp)
+            packet_ids.append(packet_id)
+            packet_segments.append(segment_id)
 
     if not packets:
         empty = np.zeros((0, NUM_SUBCARRIERS), dtype=np.float32)
@@ -377,17 +448,34 @@ def load_csv_packets(csv_path, expected_mac=EXPECTED_MAC, return_stats=False):
             'drop_mad': 0,
             'drop_jump': 0,
         }
+        stats.update(sequence_gap_stats(raw_packet_ids))
+        if return_stats and return_packet_ids:
+            return empty, stats, np.zeros(0, dtype=np.int64)
         if return_stats:
             return empty, stats
         return empty
 
     matrix = np.stack(packets, axis=0)
-    filtered, stats = filter_amplitude_matrix(matrix)
+    capture_sequence_stats = sequence_gap_stats(raw_packet_ids)
+    filtered, stats, kept_indices = filter_amplitude_matrix(matrix, return_indices=True)
+    filtered_ids = np.asarray(packet_ids, dtype=np.int64)[kept_indices]
+    # Segment IDs encode only genuine capture loss observed before filtering.
+    # Content-based filtering must not manufacture a timing discontinuity.
+    stats['_packet_segments'] = np.asarray(packet_segments, dtype=np.int32)[kept_indices]
+    stats['_raw_packet_timestamps'] = np.asarray([
+        -1 if timestamp is None else timestamp
+        for timestamp in raw_packet_timestamps
+    ], dtype=np.int64)
     stats['drop_corrupt'] = drop_corrupt
     stats['drop_parse'] = drop_parse
     stats['raw_packets'] = raw_packets
     drop_total = raw_packets - stats['kept_packets']
     stats['drop_pct'] = round(100.0 * drop_total / max(raw_packets, 1), 2)
+    # These values are calculated before content-based filtering, so they
+    # describe actual capture loss rather than packets intentionally dropped.
+    stats.update(capture_sequence_stats)
+    if return_stats and return_packet_ids:
+        return filtered, stats, filtered_ids
     if return_stats:
         return filtered, stats
     return filtered
@@ -499,9 +587,7 @@ def discover_capture_files(empty_source='all'):
                     continue
                 seen.add(path)
                 subgroup = 'empty_fan_on_live' if path.name.startswith('live_empty_') else 'empty_fan_on'
-                repeat = LIVE_EMPTY_TRAIN_REPEAT if path.name.startswith('live_empty_') else 1
-                for _ in range(repeat):
-                    add(path, 'empty', subgroup)
+                add(path, 'empty', subgroup)
 
     for label, root in (('presence', PRESENCE_DIR), ('motion', MOTION_DIR)):
         if not root.exists():
@@ -538,16 +624,46 @@ def discover_capture_files(empty_source='all'):
     return files
 
 
-def estimate_sample_rate(n_packets, label, filename=''):
-    """Estimate Hz from packet count; live captures use filename duration hints."""
+def timestamp_duration_seconds(timestamps):
+    """Return elapsed CSI time from a uint32 microsecond timestamp sequence.
+
+    The capture writer stores ESP-IDF's ``local_timestamp`` in every CSV row.
+    It is the only reliable duration source for a ``live_empty_*`` file: those
+    files are currently two minutes long, while their filename has no duration.
+    ``None`` is returned for missing or implausible timestamp data so older CSVs
+    continue to use the class-duration fallback below.
+    """
+    values = np.asarray(timestamps, dtype=np.int64)
+    values = values[values >= 0]
+    if values.size < 2:
+        return None
+    # Prefer the ordinary non-wrapping span.  A receiver timer can reset near
+    # the beginning or end of a capture; in that case first/last would look
+    # like a multi-hour wrap even though most samples still cover 120 seconds.
+    ordinary_span_us = int(values.max() - values.min())
+    if MIN_TIMESTAMP_DURATION_SEC * 1_000_000 <= ordinary_span_us <= MAX_TIMESTAMP_DURATION_SEC * 1_000_000:
+        return ordinary_span_us / 1_000_000.0
+    elapsed_us = int((values[-1] - values[0]) % CSI_TIMESTAMP_WRAP_US)
+    elapsed_sec = elapsed_us / 1_000_000.0
+    if not MIN_TIMESTAMP_DURATION_SEC <= elapsed_sec <= MAX_TIMESTAMP_DURATION_SEC:
+        return None
+    return elapsed_sec
+
+
+def estimate_sample_rate(n_packets, label, filename='', timestamp_duration_sec=None):
+    """Estimate retained-packet Hz using CSI time when it is trustworthy."""
     name = Path(filename).name if filename else ''
-    if name.startswith('live_empty_'):
+    if timestamp_duration_sec is not None:
+        duration = timestamp_duration_sec
+    elif name.startswith('live_empty_'):
         if '30m' in name:
             duration = 1800.0
         elif '30s' in name:
             duration = 30.0
         else:
-            duration = 60.0
+            # scripts/capture_empty_20_windows.ps1 defaults to 120 seconds.
+            # Historical files omit that duration from their filename.
+            duration = 120.0
     else:
         duration = DURATION_BY_CLASS.get(label, 120.0)
     if n_packets <= 0:
@@ -562,6 +678,19 @@ def window_indices(n_packets, sample_rate, win_sec, hop_sec):
         return []
     starts = list(range(0, n_packets - win_len + 1, hop_len))
     return [(s, s + win_len) for s in starts]
+
+
+def has_large_sequence_gap(packet_ids, start, end,
+                           max_missing=MAX_MISSING_PACKETS_PER_WINDOW_GAP):
+    """Return whether a window crosses an ID gap too large to be continuous."""
+    ids = np.asarray(packet_ids[start:end], dtype=np.int64)
+    return bool(ids.size > 1 and np.any(np.diff(ids) > max_missing + 1))
+
+
+def crosses_capture_gap(packet_segments, start, end):
+    """Return whether a window crosses a genuine, pre-filter capture gap."""
+    segments = packet_segments[start:end]
+    return bool(segments.size > 1 and segments[0] != segments[-1])
 
 
 def window_center_time(start, end, sample_rate):
@@ -634,10 +763,19 @@ def labels_for_window(label, center_time, fall_offset=None, fall_window=None):
 def process_file(entry, target_1s=TARGET_SEQ_1S, target_2s=TARGET_SEQ_2S,
                  reference_baseline=None):
     """Process one CSV into window lists."""
-    raw_matrix, filter_stats = load_csv_packets(entry['path'], return_stats=True)
+    raw_matrix, filter_stats, packet_ids = load_csv_packets(
+        entry['path'], return_stats=True, return_packet_ids=True,
+    )
+    packet_segments = filter_stats.pop('_packet_segments', np.zeros(
+        len(packet_ids), dtype=np.int32,
+    ))
+    raw_packet_timestamps = filter_stats.pop(
+        '_raw_packet_timestamps', np.zeros(0, dtype=np.int64),
+    )
     file_stats = dict(filter_stats)
     file_stats['skipped_reason'] = ''
     file_stats['windows_rejected'] = 0
+    file_stats['windows_gap_rejected'] = 0
     file_stats['bad_file'] = 0
 
     if filter_stats['raw_packets'] < MIN_FILE_PACKETS:
@@ -658,14 +796,29 @@ def process_file(entry, target_1s=TARGET_SEQ_1S, target_2s=TARGET_SEQ_2S,
         return [], 0, 0.0, file_stats
 
     matrix = apply_baseline(raw_matrix, reference_baseline)
-    matrix, norm_stats = filter_normalized_matrix(matrix)
+    matrix, norm_stats, norm_keep = filter_normalized_matrix(matrix, return_mask=True)
+    packet_ids = packet_ids[norm_keep]
+    packet_segments = packet_segments[norm_keep]
     file_stats['drop_norm_spike'] = norm_stats['drop_norm_spike']
     if matrix.size == 0:
         file_stats['skipped_reason'] = 'no_packets_after_norm_filter'
         return [], 0, 0.0, file_stats
 
     n_packets = matrix.shape[0]
-    sample_rate = estimate_sample_rate(n_packets, entry['label'], entry['path'].name)
+    file_stats['post_filter_sequence_large_gaps'] = int(
+        np.sum(np.diff(packet_segments) > 0)
+    ) if packet_segments.size > 1 else 0
+    capture_duration_sec = timestamp_duration_seconds(raw_packet_timestamps)
+    # Only live empty captures depend on a timestamp duration.  Other legacy
+    # scenarios have known recording lengths, and a few contain invalid timer
+    # jumps from a receiver restart.
+    if not path_name.startswith('live_empty_'):
+        capture_duration_sec = None
+    file_stats['capture_duration_sec'] = capture_duration_sec or 0.0
+    sample_rate = estimate_sample_rate(
+        n_packets, entry['label'], entry['path'].name,
+        timestamp_duration_sec=capture_duration_sec,
+    )
 
     fall_offset = entry.get('fall_offset_sec', DEFAULT_FALL_OFFSET_SEC)
     fall_window = entry.get('fall_window_sec', DEFAULT_FALL_WINDOW_SEC)
@@ -674,6 +827,9 @@ def process_file(entry, target_1s=TARGET_SEQ_1S, target_2s=TARGET_SEQ_2S,
     hop_fall = HOP_FALL if entry['label'] == 'fall' else HOP_2S
 
     for start, end in window_indices(n_packets, sample_rate, WIN_2S, hop_fall):
+        if crosses_capture_gap(packet_segments, start, end):
+            file_stats['windows_gap_rejected'] += 1
+            continue
         win2 = matrix[start:end]
         if not is_valid_window(win2):
             file_stats['windows_rejected'] += 1
@@ -703,8 +859,13 @@ def process_file(entry, target_1s=TARGET_SEQ_1S, target_2s=TARGET_SEQ_2S,
 
     if entry['label'] in ('presence', 'motion'):
         for start, end in window_indices(n_packets, sample_rate, WIN_1S, HOP_1S):
+            context_start = max(start - (end - start), 0)
+            if (crosses_capture_gap(packet_segments, start, end)
+                    or crosses_capture_gap(packet_segments, context_start, end)):
+                file_stats['windows_gap_rejected'] += 1
+                continue
             win1 = matrix[start:end]
-            win2_ctx = matrix[max(start - (end - start), 0):end]
+            win2_ctx = matrix[context_start:end]
             if not is_valid_window(win2_ctx):
                 file_stats['windows_rejected'] += 1
                 continue
@@ -869,6 +1030,14 @@ def build_split_memmap(file_entries, tmp_dir, split_name, file_id_offset=0,
             'drop_norm_spike': file_stats.get('drop_norm_spike', 0),
             'bad_file': file_stats.get('bad_file', 0),
             'windows_rejected': file_stats.get('windows_rejected', 0),
+            'windows_gap_rejected': file_stats.get('windows_gap_rejected', 0),
+            'sequence_gaps': file_stats.get('sequence_gaps', 0),
+            'sequence_missing': file_stats.get('sequence_missing', 0),
+            'sequence_large_gaps': file_stats.get('sequence_large_gaps', 0),
+            'post_filter_sequence_large_gaps': file_stats.get(
+                'post_filter_sequence_large_gaps', 0
+            ),
+            'capture_duration_sec': round(file_stats.get('capture_duration_sec', 0.0), 3),
             'packets': n_packets,
             'sample_rate_hz': round(sample_rate, 2),
             'windows': n_file_windows,
@@ -1005,6 +1174,8 @@ def main():
     print()
 
     train_files, val_files = split_files(file_entries, val_ratio=args.val_ratio, seed=args.seed)
+    # Class weighting happens inside train_cascade.py. Do not duplicate source
+    # recordings here, since duplicate windows add no new information.
     print(f'Train files: {len(train_files)} | Val files: {len(val_files)}')
     print(f'Baseline mode: {args.baseline_mode}')
 
@@ -1077,6 +1248,7 @@ def main():
             'max_window_delta': MAX_WINDOW_DELTA,
             'max_window_abs': MAX_WINDOW_ABS,
             'max_norm_pkt_abs': MAX_NORM_PKT_ABS,
+            'max_missing_packets_per_window_gap': MAX_MISSING_PACKETS_PER_WINDOW_GAP,
         },
     }
     if reference_baseline is not None:

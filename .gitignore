@@ -52,3 +52,6 @@ firmware/**/build/
 *.txt
 !requirements.txt
 !firmware/**/CMakeLists.txt
+
+data/dataset/
+*.npz

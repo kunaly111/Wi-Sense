@@ -55,4 +55,22 @@ menu "WiSense Light (Relay + LDR)"
             While Presence or Motion is active, poll the LDR at this interval
             and turn the relay ON when the room becomes dark.
 
+    config WISENSE_LIGHT_LDR_DEBOUNCE_MS
+        int "LDR debounce sample interval (ms)"
+        range 20 2000
+        default 200
+        help
+            How often the raw LDR pin is sampled for debouncing. Runs
+            continuously (not just while occupied) so wisense_light_is_dark()
+            is always settled.
+
+    config WISENSE_LIGHT_LDR_DEBOUNCE_COUNT
+        int "LDR debounce — consecutive matching samples required"
+        range 1 20
+        default 3
+        help
+            The reported dark/bright state only flips after this many
+            consecutive samples agree, to reject chatter right at the
+            day/night threshold.
+
 endmenu

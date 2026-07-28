@@ -276,6 +276,11 @@ class CaptureValidator:
         self.len_ok = 0
         self.len_bad = 0
         self.first_len_printed = False
+        self.last_id = None
+        self.sequence_received = 0
+        self.sequence_missing = 0
+        self.sequence_reordered = 0
+        self.sequence_resets = 0
         self._counts = {
             'element number is not equal': 0,
             'data is incomplete': 0,
@@ -318,9 +323,26 @@ class CaptureValidator:
 
         return True, None, csi_data_len, len(csi_raw_data)
 
-    def record_ok(self, csi_data_len):
+    def record_ok(self, csi_data_len, sequence_id):
         self.saved += 1
         self.len_ok += 1
+        if self.last_id is not None:
+            delta = (sequence_id - self.last_id) & 0xFFFFFFFF
+            if delta == 0 or delta > 0x7FFFFFFF:
+                # A sender reboot restarts app_main's counter at zero. Treat a
+                # low new counter after an established stream as a new epoch.
+                if sequence_id < 1000 and self.last_id >= 1000:
+                    self.sequence_resets += 1
+                    self.last_id = sequence_id
+                else:
+                    # Duplicate or stale frame; retain the newest sequence frontier.
+                    self.sequence_reordered += 1
+            else:
+                self.sequence_missing += delta - 1
+                self.last_id = sequence_id
+        else:
+            self.last_id = sequence_id
+        self.sequence_received += 1
         if not self.first_len_printed:
             self.first_len_printed = True
             print('csi_len:', csi_data_len)
@@ -341,6 +363,11 @@ class CaptureValidator:
         rate = self.saved / elapsed_s if elapsed_s > 0 else 0.0
         ok_pct = (100.0 * self.len_ok / self.saved) if self.saved else 0.0
         reject_pct = (100.0 * self.rejected / packets_seen) if packets_seen else 0.0
+        sequence_expected = self.sequence_received + self.sequence_missing
+        sequence_loss_pct = (
+            100.0 * self.sequence_missing / sequence_expected
+            if sequence_expected else 0.0
+        )
 
         if self.saved == 0:
             health = 'BAD - no valid packets saved yet'
@@ -356,13 +383,26 @@ class CaptureValidator:
         return (
             f'packets: {packets_seen} | saved: {self.saved} | rejected: {self.rejected} '
             f'({reject_pct:.2f}%) | len={self.expected_len or "any"}: {self.len_ok} ({ok_pct:.1f}%) | '
-            f'rate: {rate:.1f} Hz | resync_bytes: {sync_shifts} | STATUS: {health}'
+            f'rate: {rate:.1f} Hz | tx_missing: {self.sequence_missing}/{sequence_expected} '
+            f'({sequence_loss_pct:.2f}%) | reordered: {self.sequence_reordered} | '
+            f'tx_resets: {self.sequence_resets} | '
+            f'resync_bytes: {sync_shifts} | STATUS: {health}'
         )
 
     def summary(self):
         print('--- capture summary ---')
         print(f'saved: {self.saved}')
         print(f'rejected: {self.rejected}')
+        sequence_expected = self.sequence_received + self.sequence_missing
+        sequence_loss_pct = (
+            100.0 * self.sequence_missing / sequence_expected
+            if sequence_expected else 0.0
+        )
+        print(
+            f'tx sequence loss: {self.sequence_missing}/{sequence_expected} '
+            f'({sequence_loss_pct:.2f}%), reordered/duplicate: {self.sequence_reordered}, '
+            f'tx resets: {self.sequence_resets}'
+        )
         for reason, count in self._counts.items():
             if count:
                 print(f'  {reason}: {count}')
@@ -450,7 +490,7 @@ def capture_binary_csi(port, baudrate, csv_writer, log_file_fd, csv_file=None,
                     csv_writer.writerow(columns)
                     header_written = True
                 csv_writer.writerow(row)
-                validator.record_ok(detail_a)
+                validator.record_ok(detail_a, int(row[1]))
 
             if csv_file is not None and validator.saved and validator.saved % 100 == 0:
                 csv_file.flush()
@@ -491,7 +531,11 @@ def main():
     args = parser.parse_args()
     expected_len = args.expected_len if args.expected_len > 0 else None
 
-    with open(args.store, 'w', newline='') as csv_file, open(args.log, 'w') as log_file:
+    # Serial startup noise can contain arbitrary bytes. Preserve its decoded
+    # replacement characters in UTF-8 instead of failing on the Windows ANSI
+    # code page while writing the diagnostic log.
+    with (open(args.store, 'w', newline='', encoding='utf-8') as csv_file,
+          open(args.log, 'w', encoding='utf-8', errors='replace') as log_file):
         csv_writer = csv.writer(csv_file)
         return capture_binary_csi(
             args.port,

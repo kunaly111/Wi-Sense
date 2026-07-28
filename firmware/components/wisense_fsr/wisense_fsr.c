@@ -1,5 +1,9 @@
 /*
  * FSR406 analog pressure sensor driver (ADC).
+ *
+ * wisense_fsr_is_pressed() is smoothed (simple moving average) and uses a
+ * two-threshold Schmitt trigger (latched s_pressed) rather than a single
+ * threshold, so a reading sitting near the boundary doesn't chatter.
  */
 #include "esp_adc/adc_oneshot.h"
 #include "esp_check.h"
@@ -10,11 +14,32 @@
 
 static const char *TAG = "wisense_fsr";
 
+/* Simple IIR moving average: smoothed += (raw - smoothed) / N. */
+#define FSR_SMOOTHING_N  4
+
 static adc_oneshot_unit_handle_t s_adc;
 static adc_channel_t s_channel;
 static int s_gpio = -1;
 static int s_last_raw;
+static int s_smoothed;
+static bool s_pressed;
 static bool s_ready;
+
+int wisense_fsr_read_raw(void)
+{
+    if (!s_ready) {
+        return 0;
+    }
+
+    int raw = 0;
+    if (adc_oneshot_read(s_adc, s_channel, &raw) != ESP_OK) {
+        return s_last_raw;
+    }
+
+    s_last_raw = raw;
+    s_smoothed += (raw - s_smoothed) / FSR_SMOOTHING_N;
+    return raw;
+}
 
 esp_err_t wisense_fsr_init(int gpio)
 {
@@ -47,24 +72,14 @@ esp_err_t wisense_fsr_init(int gpio)
     s_ready = true;
 
     s_last_raw = wisense_fsr_read_raw();
-    ESP_LOGI(TAG, "FSR ready (GPIO%d raw=%d threshold=%d)",
-             s_gpio, s_last_raw, CONFIG_WISENSE_FSR_PRESS_THRESHOLD);
+    /* Seed the average from the first sample so it doesn't ramp up from 0. */
+    s_smoothed = s_last_raw;
+    s_pressed = (s_smoothed >= CONFIG_WISENSE_FSR_PRESS_THRESHOLD);
+
+    ESP_LOGI(TAG, "FSR ready (GPIO%d raw=%d press=%d release=%d)",
+             s_gpio, s_last_raw, CONFIG_WISENSE_FSR_PRESS_THRESHOLD,
+             CONFIG_WISENSE_FSR_RELEASE_THRESHOLD);
     return ESP_OK;
-}
-
-int wisense_fsr_read_raw(void)
-{
-    if (!s_ready) {
-        return 0;
-    }
-
-    int raw = 0;
-    if (adc_oneshot_read(s_adc, s_channel, &raw) != ESP_OK) {
-        return s_last_raw;
-    }
-
-    s_last_raw = raw;
-    return raw;
 }
 
 bool wisense_fsr_is_pressed(void)
@@ -73,5 +88,17 @@ bool wisense_fsr_is_pressed(void)
         return false;
     }
 
-    return wisense_fsr_read_raw() >= CONFIG_WISENSE_FSR_PRESS_THRESHOLD;
+    (void)wisense_fsr_read_raw();
+
+    if (s_pressed) {
+        if (s_smoothed <= CONFIG_WISENSE_FSR_RELEASE_THRESHOLD) {
+            s_pressed = false;
+        }
+    } else {
+        if (s_smoothed >= CONFIG_WISENSE_FSR_PRESS_THRESHOLD) {
+            s_pressed = true;
+        }
+    }
+
+    return s_pressed;
 }

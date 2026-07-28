@@ -1,3 +1,3 @@
-idf_component_register(SRCS "app_main.c" "emergency_tx.c"
+idf_component_register(SRCS "app_main.c"
                     INCLUDE_DIRS "."
-                    REQUIRES nvs_flash wisense_espnow wisense_emergency_tx)
+                    REQUIRES nvs_flash esp_wifi esp_netif esp_event)

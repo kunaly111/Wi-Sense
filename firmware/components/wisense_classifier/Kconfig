@@ -24,13 +24,17 @@ menu "WiSense Classifier"
         default 0
         help
             UART used to read single-character class keys from idf.py monitor.
-            UART0 is the default console on most ESP32 DevKit boards.
+            UART0 is the default console on most ESP32 DevKit boards. Ignored
+            on boards whose console is the native USB-Serial/JTAG peripheral
+            (CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG) — e.g. ESP32-S3-DevKitC-1 —
+            since that peripheral is used instead.
 
     config WISENSE_CLASSIFIER_UART_BAUD
         int "Placeholder classifier UART baud rate"
         depends on WISENSE_CLASSIFIER_PLACEHOLDER
         default 115200
         help
-            Must match the console baud rate used by idf.py monitor.
+            Must match the console baud rate used by idf.py monitor. Ignored
+            when the console is native USB-Serial/JTAG (no baud rate concept).
 
 endmenu

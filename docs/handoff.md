@@ -6,6 +6,41 @@
 
 This document is the **continuation brief** for Cursor / a new laptop. Read this first, then open the firmware paths below.
 
+---
+
+## 0A. CSI/ML update — 2026-07-25
+
+### Dataset and preprocessing
+
+- Dataset root: `data/dataset`.
+- The current-room empty dataset now includes 20 new two-minute captures:
+  `data/dataset/empty_fan_on/live_empty_20260725_203050_01.csv` through `_20.csv`.
+- Reusable capture helper: `scripts/capture_empty_20_windows.ps1`.
+- `python/preprocess/preprocess_csi.py` performs a file-level grouped split; source recordings are never duplicated across train and validation.
+- It records CSI packet-ID loss in `processed/preprocess_manifest.csv` and rejects windows only for genuine large capture gaps, not ordinary packet-quality filtering.
+
+### Training and inference
+
+- Trainer: `python/train/train_cascade.py`.
+- Model artifact: `models/csi_cascade.joblib`; report: `models/csi_cascade_report.json`.
+- Occupied, motion, and fall are separate binary stages. Fall labels are **only** from each fall manifest's event interval: `fall_offset_sec=10.0`, `fall_window_sec=3.0`, i.e. 8.5–11.5 s window centres.
+- The fall trainer's `--fall-training fall-only` mode trains from fall recordings' event versus pre/post-event windows, then reports false positives on non-fall validation files.
+- Live runner: `python/live/live_cascade_detect.py -p COM13`.
+- Default live mode uses the saved training baseline. Do **not** enable startup session calibration for this model: it changes the feature distribution and was observed to suppress live motion scores.
+
+### Required commands
+
+```powershell
+$env:PYTHONPATH = "python"
+python .\python\preprocess\preprocess_csi.py --dataset-root .\data\dataset --output-dir .\data\dataset\processed
+python .\python\train\train_cascade.py --train .\data\dataset\processed\train.npz --val .\data\dataset\processed\val.npz --fall-training fall-only
+python .\python\live\live_cascade_detect.py -p COM13
+```
+
+### Current limitation
+
+The earlier fall model was weak and should not be treated as a safety-grade alarm. Always validate the saved report on held-out files before using a new model live.
+
 **Also see:**
 - [LIVE_DETECTION.md](./LIVE_DETECTION.md) — CSI ML live detection runbook (Python cascade)
 - [../README.md](../README.md) — repo layout / CSI capture overview

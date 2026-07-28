@@ -1,6 +1,15 @@
 /*
  * Relay + digital LDR light automation.
+ *
+ * s_current_class / s_prev_class / s_relay_on / the debounced LDR state are
+ * touched from more than one FreeRTOS task (the classifier's on-change
+ * callback vs. esp_timer callbacks), so every public entry point takes
+ * s_mutex for its whole body. Internal helpers assume the caller already
+ * holds the lock.
  */
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+
 #include "driver/gpio.h"
 #include "esp_check.h"
 #include "esp_log.h"
@@ -12,6 +21,7 @@
 
 static const char *TAG = "wisense_light";
 
+static SemaphoreHandle_t s_mutex;
 static int s_relay_gpio = -1;
 static int s_ldr_gpio = -1;
 static bool s_ready;
@@ -20,6 +30,14 @@ static wisense_class_t s_prev_class = WISENSE_CLASS_EMPTY;
 static wisense_class_t s_current_class = WISENSE_CLASS_EMPTY;
 static esp_timer_handle_t s_empty_timer;
 static esp_timer_handle_t s_ldr_poll_timer;
+
+/* Always-on debounce, independent of s_ldr_poll_timer (which only re-applies
+ * relay policy while occupied). Keeps wisense_light_is_dark() settled even
+ * before the first occupied-state poll. */
+static esp_timer_handle_t s_ldr_debounce_timer;
+static bool s_ldr_dark_debounced;
+static bool s_ldr_debounce_candidate;
+static int s_ldr_debounce_count;
 
 static int relay_on_level(void)
 {
@@ -80,24 +98,64 @@ static void ldr_poll_start(void)
                              (uint64_t)CONFIG_WISENSE_LIGHT_LDR_POLL_MS * 1000ULL);
 }
 
+/* Raw (undebounced) read — only ldr_debounce_cb should call this. Everything
+ * else must go through wisense_light_is_dark() / s_ldr_dark_debounced. */
+static bool ldr_raw_is_dark(void)
+{
+    int level = gpio_get_level(s_ldr_gpio);
+#if CONFIG_WISENSE_LIGHT_LDR_DARK_IS_LOW
+    return level == 0;
+#else
+    return level != 0;
+#endif
+}
+
+static void ldr_debounce_cb(void *arg)
+{
+    (void)arg;
+
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+
+    bool raw = ldr_raw_is_dark();
+    if (raw == s_ldr_debounce_candidate) {
+        if (s_ldr_debounce_count < CONFIG_WISENSE_LIGHT_LDR_DEBOUNCE_COUNT) {
+            s_ldr_debounce_count++;
+        }
+    } else {
+        s_ldr_debounce_candidate = raw;
+        s_ldr_debounce_count = 1;
+    }
+
+    if (s_ldr_debounce_count >= CONFIG_WISENSE_LIGHT_LDR_DEBOUNCE_COUNT) {
+        s_ldr_dark_debounced = s_ldr_debounce_candidate;
+    }
+
+    xSemaphoreGive(s_mutex);
+}
+
 static void empty_timer_cb(void *arg)
 {
     (void)arg;
 
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+
     if (s_current_class != WISENSE_CLASS_EMPTY) {
         ESP_LOGI(TAG, "Empty timer fired but class is %s — relay unchanged",
                  wisense_class_to_string(s_current_class));
+        xSemaphoreGive(s_mutex);
         return;
     }
 
     if (!s_relay_on) {
         ESP_LOGD(TAG, "Empty timer fired — relay already OFF");
+        xSemaphoreGive(s_mutex);
         return;
     }
 
     ESP_LOGI(TAG, "Empty for %d s — relay OFF",
              CONFIG_WISENSE_LIGHT_EMPTY_OFF_SEC);
     (void)relay_set(false);
+    xSemaphoreGive(s_mutex);
 }
 
 static void apply_occupied_light_policy(void)
@@ -115,24 +173,32 @@ static void apply_occupied_light_policy(void)
         return;
     }
 
-    if (wisense_light_is_dark() && !s_relay_on) {
-        ESP_LOGI(TAG, "Room dark while %s — relay ON",
+    if (s_ldr_dark_debounced) {
+        if (!s_relay_on) {
+            ESP_LOGI(TAG, "Room dark while %s — relay ON",
+                     wisense_class_to_string(s_current_class));
+            (void)relay_set(true);
+        }
+    } else if (s_relay_on) {
+        ESP_LOGI(TAG, "Room bright while %s — relay OFF",
                  wisense_class_to_string(s_current_class));
-        (void)relay_set(true);
+        (void)relay_set(false);
     }
 }
 
 static void ldr_poll_cb(void *arg)
 {
     (void)arg;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
     apply_occupied_light_policy();
+    xSemaphoreGive(s_mutex);
 }
 
 static void handle_empty_to_occupied(wisense_class_t new_class)
 {
     if (s_current_class == WISENSE_CLASS_PRESENCE && wisense_fsr_is_pressed()) {
         ESP_LOGI(TAG, "Empty -> Presence on bed — light stays OFF (sleeping)");
-    } else if (wisense_light_is_dark()) {
+    } else if (s_ldr_dark_debounced) {
         ESP_LOGI(TAG, "Empty -> %s in dark room — relay ON",
                  wisense_class_to_string(new_class));
     } else {
@@ -154,6 +220,9 @@ esp_err_t wisense_light_init(int relay_gpio, int ldr_gpio)
     if (ldr_gpio < 0) {
         ldr_gpio = CONFIG_WISENSE_LIGHT_LDR_GPIO;
     }
+
+    s_mutex = xSemaphoreCreateMutex();
+    ESP_RETURN_ON_FALSE(s_mutex != NULL, ESP_ERR_NO_MEM, TAG, "mutex");
 
     gpio_config_t relay_cfg = {
         .pin_bit_mask = (1ULL << relay_gpio),
@@ -185,15 +254,29 @@ esp_err_t wisense_light_init(int relay_gpio, int ldr_gpio)
     };
     ESP_RETURN_ON_ERROR(esp_timer_create(&ldr_poll_args, &s_ldr_poll_timer), TAG, "ldr poll timer");
 
+    const esp_timer_create_args_t ldr_debounce_args = {
+        .callback = ldr_debounce_cb,
+        .name = "ldr_debounce",
+    };
+    ESP_RETURN_ON_ERROR(esp_timer_create(&ldr_debounce_args, &s_ldr_debounce_timer), TAG, "ldr debounce timer");
+
     s_relay_gpio = relay_gpio;
     s_ldr_gpio = ldr_gpio;
     s_prev_class = WISENSE_CLASS_EMPTY;
     s_current_class = WISENSE_CLASS_EMPTY;
     s_ready = true;
 
+    /* Seed the debounced reading from a live sample so boot state is
+     * correct immediately instead of waiting a full debounce window. */
+    s_ldr_debounce_candidate = ldr_raw_is_dark();
+    s_ldr_dark_debounced = s_ldr_debounce_candidate;
+    s_ldr_debounce_count = CONFIG_WISENSE_LIGHT_LDR_DEBOUNCE_COUNT;
+    esp_timer_start_periodic(s_ldr_debounce_timer,
+                             (uint64_t)CONFIG_WISENSE_LIGHT_LDR_DEBOUNCE_MS * 1000ULL);
+
     ESP_RETURN_ON_ERROR(relay_set(false), TAG, "relay off");
 
-    ESP_LOGI(TAG, "Light automation ready (relay=GPIO%d on=%s, LDR=GPIO%d dark=%s, empty_off=%ds, ldr_poll=%dms)",
+    ESP_LOGI(TAG, "Light automation ready (relay=GPIO%d on=%s, LDR=GPIO%d dark=%s, empty_off=%ds, ldr_poll=%dms, debounce=%dx%dms)",
              s_relay_gpio,
              relay_on_level() ? "HIGH" : "LOW",
              s_ldr_gpio,
@@ -203,18 +286,28 @@ esp_err_t wisense_light_init(int relay_gpio, int ldr_gpio)
              "HIGH",
 #endif
              CONFIG_WISENSE_LIGHT_EMPTY_OFF_SEC,
-             CONFIG_WISENSE_LIGHT_LDR_POLL_MS);
+             CONFIG_WISENSE_LIGHT_LDR_POLL_MS,
+             CONFIG_WISENSE_LIGHT_LDR_DEBOUNCE_COUNT,
+             CONFIG_WISENSE_LIGHT_LDR_DEBOUNCE_MS);
     return ESP_OK;
 }
 
 esp_err_t wisense_light_relay_off(void)
 {
-    return relay_set(false);
+    ESP_RETURN_ON_FALSE(s_ready, ESP_ERR_INVALID_STATE, TAG, "not init");
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    esp_err_t err = relay_set(false);
+    xSemaphoreGive(s_mutex);
+    return err;
 }
 
 esp_err_t wisense_light_relay_on(void)
 {
-    return relay_set(true);
+    ESP_RETURN_ON_FALSE(s_ready, ESP_ERR_INVALID_STATE, TAG, "not init");
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    esp_err_t err = relay_set(true);
+    xSemaphoreGive(s_mutex);
+    return err;
 }
 
 bool wisense_light_is_dark(void)
@@ -223,17 +316,17 @@ bool wisense_light_is_dark(void)
         return false;
     }
 
-    int level = gpio_get_level(s_ldr_gpio);
-#if CONFIG_WISENSE_LIGHT_LDR_DARK_IS_LOW
-    return level == 0;
-#else
-    return level != 0;
-#endif
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    bool dark = s_ldr_dark_debounced;
+    xSemaphoreGive(s_mutex);
+    return dark;
 }
 
 esp_err_t wisense_light_on_class_change(wisense_class_t new_class)
 {
     ESP_RETURN_ON_FALSE(s_ready, ESP_ERR_INVALID_STATE, TAG, "not init");
+
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
 
     wisense_class_t previous = s_prev_class;
     s_prev_class = new_class;
@@ -249,6 +342,7 @@ esp_err_t wisense_light_on_class_change(wisense_class_t new_class)
                      CONFIG_WISENSE_LIGHT_EMPTY_OFF_SEC);
             empty_timer_start();
         }
+        xSemaphoreGive(s_mutex);
         return ESP_OK;
     }
 
@@ -259,9 +353,11 @@ esp_err_t wisense_light_on_class_change(wisense_class_t new_class)
             apply_occupied_light_policy();
         }
         ldr_poll_start();
+        xSemaphoreGive(s_mutex);
         return ESP_OK;
     }
 
     ldr_poll_stop();
+    xSemaphoreGive(s_mutex);
     return ESP_OK;
 }
