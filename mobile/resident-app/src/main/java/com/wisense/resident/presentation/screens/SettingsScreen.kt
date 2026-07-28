@@ -50,6 +50,7 @@ import com.wisense.resident.presentation.MainViewModel
 fun SettingsScreen(
     viewModel: MainViewModel,
     onBack: () -> Unit,
+    onOpenStreamTest: () -> Unit,
 ) {
     val context = LocalContext.current
     val showMonitorNotification by viewModel.showMonitorNotification.collectAsStateWithLifecycle()
@@ -144,6 +145,25 @@ fun SettingsScreen(
                 ) {
                     Text("Exclude from battery optimization")
                 }
+            }
+
+            SettingsDivider()
+
+            SectionHeader("Developer")
+
+            Text(
+                text = "Phase 3 proof-of-media-path: streams this phone's camera to " +
+                    "the caregiver test app over the local network. Manual signaling " +
+                    "only — not wired to the real fall-detection trigger yet.",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Spacer(Modifier.height(12.dp))
+            Button(
+                onClick = onOpenStreamTest,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text("Test streaming (Phase 3)")
             }
 
             SettingsDivider()
