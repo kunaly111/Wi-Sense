@@ -6,9 +6,11 @@ import android.content.pm.PackageManager
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
+import android.os.PowerManager
 import android.util.Log
 import androidx.camera.core.Camera
 import androidx.camera.core.CameraSelector
+import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
@@ -53,6 +55,7 @@ class EmergencyCaptureController(
 
     private var cameraProvider: ProcessCameraProvider? = null
     private var preview: Preview? = null
+    private var imageAnalysis: ImageAnalysis? = null
     private var camera: Camera? = null
     private var audioRecord: AudioRecord? = null
     private var audioJob: Job? = null
@@ -99,11 +102,33 @@ class EmergencyCaptureController(
             preview = Preview.Builder().build().also { p ->
                 p.setSurfaceProvider(previewView.surfaceProvider)
             }
+            imageAnalysis = ImageAnalysis.Builder().build().also { analysis ->
+                // No-op analyzer: this use case exists only to give the capture
+                // session a surface that doesn't depend on anything being on-screen.
+                // Phase 3/5 is what does real frame processing (WebRTC track).
+                analysis.setAnalyzer(ContextCompat.getMainExecutor(context)) { it.close() }
+            }
+
+            // CameraX configures every bound use case's surface as ONE atomic
+            // capture session — confirmed on-device that binding Preview alongside
+            // ImageAnalysis still hangs the whole session for 5s while screen-locked,
+            // because Preview's TextureView surface never arrives until the screen
+            // is drawn again, even though ImageAnalysis's surface is ready
+            // immediately. Only bind Preview when the screen is actually on;
+            // ImageAnalysis alone keeps the capture session (camera + flash +
+            // eventual streaming) alive regardless of screen state.
+            val screenOn = ContextCompat.getSystemService(context, PowerManager::class.java)
+                ?.isInteractive == true
+            val useCases = if (screenOn) {
+                arrayOf(preview!!, imageAnalysis!!)
+            } else {
+                arrayOf(imageAnalysis!!)
+            }
 
             camera = provider.bindToLifecycle(
                 lifecycleOwner,
                 CameraSelector.DEFAULT_BACK_CAMERA,
-                preview,
+                *useCases,
             )
             cameraProvider = provider
 
@@ -129,6 +154,7 @@ class EmergencyCaptureController(
         } finally {
             camera = null
             preview = null
+            imageAnalysis = null
             cameraProvider = null
         }
     }

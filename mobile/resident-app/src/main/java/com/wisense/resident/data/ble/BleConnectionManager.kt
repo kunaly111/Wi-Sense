@@ -12,13 +12,11 @@ import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothProfile
 import android.bluetooth.BluetoothStatusCodes
 import android.bluetooth.le.ScanCallback
-import android.bluetooth.le.ScanFilter
 import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
 import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Build
-import android.os.ParcelUuid
 import android.util.Log
 import androidx.core.content.ContextCompat
 import com.wisense.resident.domain.model.BleEvent
@@ -142,18 +140,24 @@ class BleConnectionManager(
 
         scanJob?.cancel()
         closeGatt()
+        // A scan may already be in flight (e.g. retryNow()/rePair() called while
+        // Scanning) — stopping the coroutine timeout above doesn't stop the OS-level
+        // scan session, and starting a second one fails with SCAN_FAILED_ALREADY_STARTED.
+        stopScanQuietly(leScanner)
         _connectionState.value = ConnectionState.Scanning
 
-        val filter = ScanFilter.Builder()
-            .setServiceUuid(ParcelUuid(WiSenseBleProtocol.SERVICE_UUID))
-            .build()
+        // No OS-level ScanFilter: the RX board's service UUID isn't exposed via a
+        // Service-UUID-list AD field Android's ScanFilter can match (confirmed on
+        // real hardware — the OS scanner parses serviceUuids=null for its adverts,
+        // even though it's visible in the raw payload). Matching is done by device
+        // name instead, case-insensitively, in onScanResult below.
         val settings = ScanSettings.Builder()
             .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
             .build()
 
         @SuppressLint("MissingPermission")
-        leScanner.startScan(listOf(filter), settings, scanCallback)
-        Log.d(TAG, "scan started (service UUID filter)")
+        leScanner.startScan(emptyList(), settings, scanCallback)
+        Log.d(TAG, "scan started (name match, no UUID filter)")
 
         scanJob = scope.launch {
             delay(SCAN_TIMEOUT_MS)
@@ -164,12 +168,24 @@ class BleConnectionManager(
         }
     }
 
+    @SuppressLint("MissingPermission")
+    private fun stopScanQuietly(leScanner: android.bluetooth.le.BluetoothLeScanner) {
+        try {
+            leScanner.stopScan(scanCallback)
+        } catch (e: Exception) {
+            // No scan was active — expected on the common path, not an error.
+            Log.d(TAG, "stopScan before restart: ${e.message}")
+        }
+    }
+
     private val scanCallback = object : ScanCallback() {
         @SuppressLint("MissingPermission")
         override fun onScanResult(callbackType: Int, result: ScanResult) {
             val device = result.device ?: return
             val name = result.scanRecord?.deviceName ?: device.name
-            if (name != WiSenseBleProtocol.DEVICE_NAME) return
+            // Case-insensitive: guards against firmware casing drift now that this
+            // is the only match criterion (no OS-level UUID filter backing it up).
+            if (!name.equals(WiSenseBleProtocol.DEVICE_NAME, ignoreCase = true)) return
 
             Log.d(TAG, "found $name at ${device.address}")
             scanner?.stopScan(this)

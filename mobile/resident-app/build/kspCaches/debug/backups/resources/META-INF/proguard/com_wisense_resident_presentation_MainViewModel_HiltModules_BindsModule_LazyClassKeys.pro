@@ -1,1 +1,0 @@
--keep,allowobfuscation,allowshrinking class com.wisense.resident.presentation.MainViewModel

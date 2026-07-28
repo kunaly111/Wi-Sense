@@ -55,3 +55,6 @@ firmware/**/build/
 
 data/dataset/
 *.npz
+
+# --- IDE workspace (Android Studio opened at repo root) ---
+.idea/

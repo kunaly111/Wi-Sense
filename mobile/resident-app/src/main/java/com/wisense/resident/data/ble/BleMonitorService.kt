@@ -46,7 +46,10 @@ class BleMonitorService : LifecycleService() {
     @Inject
     lateinit var captureController: EmergencyCaptureController
 
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    // Main, not Default: handleTriggerEvent() calls into EmergencyCaptureController,
+    // which drives CameraX's ProcessCameraProvider — main-thread-only, or
+    // bindToLifecycle()/unbindAll() throw IllegalStateException.
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
 
     override fun onBind(intent: Intent): IBinder? {
         super.onBind(intent)

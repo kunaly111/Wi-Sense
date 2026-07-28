@@ -1,5 +1,6 @@
 package com.wisense.resident.presentation.screens
 
+import android.view.ViewGroup
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -126,7 +127,16 @@ private fun CameraPreview(viewModel: MainViewModel) {
             .background(Color.Black),
     ) {
         AndroidView(
-            factory = { viewModel.previewView },
+            factory = {
+                // previewView is a singleton (survives config changes so the camera
+                // binding isn't lost on rotation) — but that means it can still be
+                // attached to a now-destroyed composition's parent (e.g. after the
+                // Activity is torn down and recreated on screen lock). Compose's
+                // AndroidView throws "child already has a parent" otherwise.
+                val preview = viewModel.previewView
+                (preview.parent as? ViewGroup)?.removeView(preview)
+                preview
+            },
             modifier = Modifier.fillMaxSize(),
         )
     }
