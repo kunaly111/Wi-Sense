@@ -10,7 +10,6 @@ import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -22,7 +21,9 @@ import androidx.core.content.ContextCompat
 import com.wisense.caregiver.data.SessionStore
 import com.wisense.caregiver.presentation.AuthScreen
 import com.wisense.caregiver.presentation.HouseLinkScreen
+import com.wisense.caregiver.presentation.SettingsScreen
 import com.wisense.caregiver.presentation.ViewerScreen
+import com.wisense.caregiver.presentation.theme.WiSenseTheme
 import com.wisense.shared.firebase.AuthClient
 
 class MainActivity : ComponentActivity() {
@@ -66,7 +67,7 @@ class MainActivity : ComponentActivity() {
         }
 
         setContent {
-            MaterialTheme {
+            WiSenseTheme {
                 Surface {
                     CaregiverApp()
                 }
@@ -75,7 +76,7 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-private enum class Screen { Auth, HouseLink, Viewer }
+private enum class Screen { Auth, HouseLink, Viewer, Settings }
 
 @Composable
 private fun CaregiverApp() {
@@ -93,6 +94,13 @@ private fun CaregiverApp() {
     when (screen) {
         Screen.Auth -> AuthScreen(onSignedIn = { screen = currentScreen() })
         Screen.HouseLink -> HouseLinkScreen(onLinked = { screen = currentScreen() })
-        Screen.Viewer -> ViewerScreen(houseId = sessionStore.houseId!!)
+        Screen.Viewer -> ViewerScreen(
+            houseId = sessionStore.houseId!!,
+            onOpenSettings = { screen = Screen.Settings },
+        )
+        Screen.Settings -> SettingsScreen(
+            onBack = { screen = currentScreen() },
+            onLoggedOut = { screen = currentScreen() },
+        )
     }
 }

@@ -41,6 +41,7 @@ class ViewerViewModel(application: Application) : AndroidViewModel(application) 
     private var webRtcClient: WebRtcClient? = null
     private var negotiatingEmergencyId: String? = null
     private var negotiationJob: Job? = null
+    private var listeningJob: Job? = null
 
     private val _uiState = MutableStateFlow<ViewerUiState>(ViewerUiState.Waiting)
     val uiState: StateFlow<ViewerUiState> = _uiState.asStateFlow()
@@ -59,11 +60,17 @@ class ViewerViewModel(application: Application) : AndroidViewModel(application) 
      * caregiver to narrow by.
      */
     fun startListening(houseId: String) {
+        // Without this, calling startListening() again (e.g. after changing
+        // the linked house code in Settings) would leave the previous
+        // collector running forever alongside the new one — both writing to
+        // the same negotiatingEmergencyId/negotiationJob fields.
+        listeningJob?.cancel()
+        reset()
         val uid = AuthClient.currentUser?.uid ?: run {
             _uiState.value = ViewerUiState.Error("not signed in")
             return
         }
-        viewModelScope.launch {
+        listeningJob = viewModelScope.launch {
             try {
                 FirebaseFirestore.getInstance()
                     .collection("wisense_emergencies")
@@ -153,6 +160,7 @@ class ViewerViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     override fun onCleared() {
+        listeningJob?.cancel()
         negotiationJob?.cancel()
         webRtcClient?.let { client -> runCatching { client.setSpeakerphoneOn(false) } }
         webRtcClient?.release()
