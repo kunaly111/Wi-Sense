@@ -7,12 +7,11 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
-import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -31,19 +30,22 @@ import org.webrtc.SurfaceViewRenderer
 import org.webrtc.VideoTrack
 
 @Composable
-fun ViewerScreen() {
+fun ViewerScreen(houseId: String) {
     val application = LocalContext.current.applicationContext as android.app.Application
     val viewModel: ViewerViewModel = viewModel(
         factory = ViewModelProvider.AndroidViewModelFactory.getInstance(application),
     )
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
-    var ipAddress by remember { mutableStateOf("") }
+
+    LaunchedEffect(houseId) {
+        viewModel.startListening(houseId)
+    }
 
     Column(
         modifier = Modifier.fillMaxSize().padding(24.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
-        Text("Wi-Sense Caregiver — Phase 3 test viewer", style = MaterialTheme.typography.titleMedium)
+        Text("Wi-Sense Caregiver", style = MaterialTheme.typography.titleMedium)
         Spacer(Modifier.height(16.dp))
 
         val streamingState = uiState as? ViewerUiState.Streaming
@@ -52,29 +54,10 @@ fun ViewerScreen() {
                 RemoteVideoView(track = streamingState.videoTrack, eglBaseContext = viewModel.eglBaseContext)
             }
         } else {
-            OutlinedTextField(
-                value = ipAddress,
-                onValueChange = { ipAddress = it },
-                label = { Text("Resident phone's IP address") },
-                modifier = Modifier.fillMaxWidth(),
-            )
-            Spacer(Modifier.height(12.dp))
-            Button(
-                onClick = { viewModel.connect(ipAddress.trim()) },
-                enabled = ipAddress.isNotBlank() &&
-                    uiState !is ViewerUiState.Connecting &&
-                    uiState !is ViewerUiState.Negotiating,
-                modifier = Modifier.fillMaxWidth(),
-            ) {
-                Text("Connect")
-            }
-            Spacer(Modifier.height(12.dp))
             Text(
                 text = when (val state = uiState) {
-                    ViewerUiState.Idle -> "Enter the resident phone's IP (same WiFi) and tap Connect. " +
-                        "Find it on the resident app's streaming test screen."
-                    ViewerUiState.Connecting -> "Connecting…"
-                    ViewerUiState.Negotiating -> "Connected — negotiating media…"
+                    ViewerUiState.Waiting -> "Waiting for an alert from this house…"
+                    ViewerUiState.Negotiating -> "Alert received — connecting to the live feed…"
                     is ViewerUiState.Error -> "Error: ${state.message}"
                     is ViewerUiState.Streaming -> ""
                 },
@@ -85,7 +68,7 @@ fun ViewerScreen() {
 }
 
 @Composable
-private fun RemoteVideoView(track: VideoTrack, eglBaseContext: EglBase.Context) {
+private fun RemoteVideoView(track: VideoTrack, eglBaseContext: EglBase.Context?) {
     var attachedRenderer by remember { mutableStateOf<SurfaceViewRenderer?>(null) }
 
     DisposableEffect(track) {
@@ -93,6 +76,8 @@ private fun RemoteVideoView(track: VideoTrack, eglBaseContext: EglBase.Context) 
             attachedRenderer?.let { track.removeSink(it) }
         }
     }
+
+    if (eglBaseContext == null) return
 
     AndroidView(
         factory = { ctx ->

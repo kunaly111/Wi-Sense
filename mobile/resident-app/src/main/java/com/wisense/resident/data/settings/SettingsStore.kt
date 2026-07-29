@@ -31,8 +31,18 @@ class SettingsStore @Inject constructor(
         _showMonitorNotification.value = show
     }
 
+    /** This house's Firestore doc ID, created once on first sign-in and reused after. */
+    private val _houseId = MutableStateFlow(prefs.getString(KEY_HOUSE_ID, null))
+    val houseId: StateFlow<String?> = _houseId.asStateFlow()
+
+    fun setHouseId(houseId: String) {
+        prefs.edit().putString(KEY_HOUSE_ID, houseId).apply()
+        _houseId.value = houseId
+    }
+
     companion object {
         private const val PREFS_NAME = "wisense_resident_settings"
         private const val KEY_SHOW_MONITOR_NOTIFICATION = "show_monitor_notification"
+        private const val KEY_HOUSE_ID = "house_id"
     }
 }

@@ -25,5 +25,10 @@ android {
 dependencies {
     implementation(libs.androidx.core.ktx)
     implementation(libs.kotlinx.coroutines.android)
+    implementation(libs.kotlinx.coroutines.play.services)
     api(libs.stream.webrtc.android)
+
+    api(platform(libs.firebase.bom))
+    api(libs.firebase.firestore)
+    api(libs.firebase.auth)
 }

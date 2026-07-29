@@ -11,6 +11,7 @@ import com.wisense.resident.data.ble.BleMonitorService
 import com.wisense.resident.data.ble.BleRepository
 import com.wisense.resident.data.emergency.EmergencyStreamController
 import com.wisense.resident.data.emergency.EmergencyStreamState
+import com.wisense.resident.data.house.HouseRepository
 import com.wisense.resident.data.settings.SettingsStore
 import com.wisense.resident.domain.model.BleEvent
 import com.wisense.resident.domain.model.ConnectionState
@@ -22,6 +23,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.scan
 import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.launch
 import javax.inject.Inject
 
 /**
@@ -33,6 +35,7 @@ class MainViewModel @Inject constructor(
     private val bleRepository: BleRepository,
     private val settingsStore: SettingsStore,
     private val emergencyStreamController: EmergencyStreamController,
+    private val houseRepository: HouseRepository,
     @ApplicationContext private val context: Context,
 ) : ViewModel() {
 
@@ -44,8 +47,6 @@ class MainViewModel @Inject constructor(
     /** The local camera track the Active Emergency screen renders. */
     val localVideoTrack = emergencyStreamController.localVideoTrack
     val eglBaseContext get() = emergencyStreamController.eglBaseContext
-    val signalingPort get() = emergencyStreamController.signalingPort
-    fun localIpAddress(): String? = emergencyStreamController.localIpAddress()
 
     /** Rolling log, newest first, capped so a long-running session stays bounded. */
     val eventLog: StateFlow<List<BleEvent>> = bleRepository.events
@@ -78,6 +79,28 @@ class MainViewModel @Inject constructor(
 
     fun setShowMonitorNotification(show: Boolean) {
         settingsStore.setShowMonitorNotification(show)
+    }
+
+    // ---------------------------------------------------------------- Caregivers
+
+    val houseId: StateFlow<String?> = settingsStore.houseId
+
+    private val _addCaregiverResult = MutableStateFlow<String?>(null)
+    val addCaregiverResult: StateFlow<String?> = _addCaregiverResult.asStateFlow()
+
+    fun addCaregiver(caregiverCode: String) {
+        viewModelScope.launch {
+            _addCaregiverResult.value = try {
+                houseRepository.addCaregiverByCode(caregiverCode)
+                "Added."
+            } catch (e: Exception) {
+                "Failed: ${e.message ?: e}"
+            }
+        }
+    }
+
+    fun clearAddCaregiverResult() {
+        _addCaregiverResult.value = null
     }
 
     fun isPaired(): Boolean =

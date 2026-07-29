@@ -6,6 +6,7 @@ import com.wisense.resident.data.ble.BleConnectionManager
 import com.wisense.resident.data.ble.BleRepository
 import com.wisense.resident.data.ble.BleRepositoryImpl
 import com.wisense.resident.data.emergency.EmergencyStreamController
+import com.wisense.resident.data.settings.SettingsStore
 import com.wisense.resident.data.streaming.StreamingController
 import dagger.Binds
 import dagger.Module
@@ -44,7 +45,8 @@ object AppModule {
     @Singleton
     fun provideEmergencyStreamController(
         @ApplicationContext context: Context,
-    ): EmergencyStreamController = EmergencyStreamController(context)
+        settingsStore: SettingsStore,
+    ): EmergencyStreamController = EmergencyStreamController(context, settingsStore)
 
     @Provides
     @Singleton

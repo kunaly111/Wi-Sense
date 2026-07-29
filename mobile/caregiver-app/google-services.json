@@ -1,0 +1,69 @@
+{
+  "project_info": {
+    "project_number": "316037626448",
+    "firebase_url": "https://hackthon-3275c-default-rtdb.firebaseio.com",
+    "project_id": "hackthon-3275c",
+    "storage_bucket": "hackthon-3275c.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:316037626448:android:3821b000661d58c88f6f55",
+        "android_client_info": {
+          "package_name": "com.wisense.caregiver.debug"
+        }
+      },
+      "oauth_client": [
+        {
+          "client_id": "316037626448-fbbes76j5q5ik0j85gha33pd1io12569.apps.googleusercontent.com",
+          "client_type": 3
+        }
+      ],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDcTyLz-U7lVvOoa831QuK50q1WLsy5Nlk"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": [
+            {
+              "client_id": "316037626448-fbbes76j5q5ik0j85gha33pd1io12569.apps.googleusercontent.com",
+              "client_type": 3
+            }
+          ]
+        }
+      }
+    },
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:316037626448:android:db1d644ddde638a58f6f55",
+        "android_client_info": {
+          "package_name": "com.wisense.resident.debug"
+        }
+      },
+      "oauth_client": [
+        {
+          "client_id": "316037626448-fbbes76j5q5ik0j85gha33pd1io12569.apps.googleusercontent.com",
+          "client_type": 3
+        }
+      ],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDcTyLz-U7lVvOoa831QuK50q1WLsy5Nlk"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": [
+            {
+              "client_id": "316037626448-fbbes76j5q5ik0j85gha33pd1io12569.apps.googleusercontent.com",
+              "client_type": 3
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

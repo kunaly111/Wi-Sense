@@ -23,6 +23,7 @@ import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
@@ -55,6 +56,9 @@ fun SettingsScreen(
     val context = LocalContext.current
     val showMonitorNotification by viewModel.showMonitorNotification.collectAsStateWithLifecycle()
     var batteryExempt by remember { mutableStateOf(context.isIgnoringBatteryOptimizations()) }
+    val houseId by viewModel.houseId.collectAsStateWithLifecycle()
+    val addCaregiverResult by viewModel.addCaregiverResult.collectAsStateWithLifecycle()
+    var caregiverCodeInput by remember { mutableStateOf("") }
 
     Scaffold(
         topBar = {
@@ -145,6 +149,44 @@ fun SettingsScreen(
                 ) {
                     Text("Exclude from battery optimization")
                 }
+            }
+
+            SettingsDivider()
+
+            SectionHeader("Caregivers")
+
+            Text(
+                text = "House code: ${houseId ?: "not set up yet"}",
+                style = MaterialTheme.typography.bodyMedium,
+            )
+            Text(
+                text = "A caregiver signs in on their own app first, then sends you " +
+                    "the 6-digit code from that app's setup screen. Enter it below to " +
+                    "give them access to this house's alerts.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Spacer(Modifier.height(12.dp))
+            OutlinedTextField(
+                value = caregiverCodeInput,
+                onValueChange = { caregiverCodeInput = it },
+                label = { Text("Caregiver's code") },
+                modifier = Modifier.fillMaxWidth(),
+            )
+            Spacer(Modifier.height(8.dp))
+            Button(
+                onClick = {
+                    viewModel.addCaregiver(caregiverCodeInput.trim())
+                    caregiverCodeInput = ""
+                },
+                enabled = caregiverCodeInput.isNotBlank(),
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text("Add caregiver")
+            }
+            addCaregiverResult?.let { result ->
+                Spacer(Modifier.height(8.dp))
+                Text(result, style = MaterialTheme.typography.bodySmall)
             }
 
             SettingsDivider()

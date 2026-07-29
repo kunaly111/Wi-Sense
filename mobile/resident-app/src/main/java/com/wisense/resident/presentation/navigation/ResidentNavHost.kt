@@ -9,13 +9,16 @@ import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
 import com.wisense.resident.data.emergency.EmergencyStreamState
 import com.wisense.resident.presentation.MainViewModel
+import com.wisense.resident.presentation.screens.AuthScreen
 import com.wisense.resident.presentation.screens.EmergencyScreen
 import com.wisense.resident.presentation.screens.IdleScreen
 import com.wisense.resident.presentation.screens.SettingsScreen
 import com.wisense.resident.presentation.screens.SetupScreen
 import com.wisense.resident.presentation.screens.StreamTestScreen
+import com.wisense.shared.firebase.AuthClient
 
 object Routes {
+    const val AUTH = "auth"
     const val SETUP = "setup"
     const val IDLE = "idle"
     const val SETTINGS = "settings"
@@ -40,7 +43,18 @@ fun ResidentNavHost() {
         }
     }
 
-    NavHost(navController = navController, startDestination = Routes.SETUP) {
+    val startDestination = if (AuthClient.currentUser != null) Routes.SETUP else Routes.AUTH
+
+    NavHost(navController = navController, startDestination = startDestination) {
+        composable(Routes.AUTH) {
+            AuthScreen(
+                onSignedIn = {
+                    navController.navigate(Routes.SETUP) {
+                        popUpTo(Routes.AUTH) { inclusive = true }
+                    }
+                },
+            )
+        }
         composable(Routes.SETUP) {
             SetupScreen(
                 viewModel = viewModel,

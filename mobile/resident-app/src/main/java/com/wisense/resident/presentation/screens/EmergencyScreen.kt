@@ -93,15 +93,6 @@ fun EmergencyScreen(viewModel: MainViewModel) {
         }
 
         Spacer(Modifier.height(16.dp))
-        // Interim, until Phase 4 (Firestore) removes the need for this: a
-        // caregiver has to manually type this address into the caregiver app.
-        Text(
-            text = "Caregiver app: connect to ${viewModel.localIpAddress() ?: "unknown"}:${viewModel.signalingPort}",
-            style = MaterialTheme.typography.bodySmall,
-            color = Color(0xFFFFDAD6),
-            textAlign = TextAlign.Center,
-        )
-        Spacer(Modifier.height(8.dp))
         Text(
             text = "Press the button on the room sensor to cancel.",
             style = MaterialTheme.typography.bodyMedium,
