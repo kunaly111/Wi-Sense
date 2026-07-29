@@ -7,12 +7,14 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
+import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.lifecycle.LifecycleService
 import com.wisense.resident.MainActivity
 import com.wisense.resident.R
 import com.wisense.resident.WiSenseResidentApp
 import com.wisense.resident.data.emergency.EmergencyStreamController
+import com.wisense.resident.data.house.HouseRepository
 import com.wisense.resident.data.settings.SettingsStore
 import com.wisense.resident.domain.model.BleEvent
 import com.wisense.resident.domain.model.ConnectionState
@@ -46,6 +48,9 @@ class BleMonitorService : LifecycleService() {
     @Inject
     lateinit var emergencyStreamController: EmergencyStreamController
 
+    @Inject
+    lateinit var houseRepository: HouseRepository
+
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
 
     override fun onBind(intent: Intent): IBinder? {
@@ -60,7 +65,17 @@ class BleMonitorService : LifecycleService() {
             inEmergency = false,
         )
         bleRepository.connectionState
-            .onEach { state -> updateNotification(state.notificationText()) }
+            .onEach { state ->
+                updateNotification(state.notificationText())
+                if (state is ConnectionState.Connected) {
+                    // Best-effort: a Firestore write failing here shouldn't
+                    // affect the BLE link itself, so it's non-fatal — no
+                    // house yet is also handled (no-ops) inside the call.
+                    runCatching { houseRepository.setResidentDeviceBleId(state.deviceAddress) }
+                        .onSuccess { Log.d(TAG, "recorded resident device BLE id ${state.deviceAddress}") }
+                        .onFailure { Log.w(TAG, "failed to record resident device BLE id", it) }
+                }
+            }
             .launchIn(scope)
         bleRepository.events
             .onEach { event -> handleTriggerEvent(event) }
@@ -176,6 +191,7 @@ class BleMonitorService : LifecycleService() {
     }
 
     companion object {
+        private const val TAG = "BleMonitorService"
         private const val NOTIFICATION_ID = 1001
         const val ACTION_START = "com.wisense.resident.action.START_MONITOR"
         const val ACTION_STOP = "com.wisense.resident.action.STOP_MONITOR"
