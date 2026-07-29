@@ -14,7 +14,6 @@ import com.wisense.resident.presentation.screens.EmergencyScreen
 import com.wisense.resident.presentation.screens.IdleScreen
 import com.wisense.resident.presentation.screens.SettingsScreen
 import com.wisense.resident.presentation.screens.SetupScreen
-import com.wisense.resident.presentation.screens.StreamTestScreen
 import com.wisense.shared.firebase.AuthClient
 
 object Routes {
@@ -23,7 +22,6 @@ object Routes {
     const val IDLE = "idle"
     const val SETTINGS = "settings"
     const val EMERGENCY = "emergency"
-    const val STREAM_TEST = "stream_test"
 }
 
 @Composable
@@ -75,14 +73,10 @@ fun ResidentNavHost() {
             SettingsScreen(
                 viewModel = viewModel,
                 onBack = { navController.popBackStack() },
-                onOpenStreamTest = { navController.navigate(Routes.STREAM_TEST) },
             )
         }
         composable(Routes.EMERGENCY) {
             EmergencyScreen(viewModel = viewModel)
-        }
-        composable(Routes.STREAM_TEST) {
-            StreamTestScreen(onBack = { navController.popBackStack() })
         }
     }
 }

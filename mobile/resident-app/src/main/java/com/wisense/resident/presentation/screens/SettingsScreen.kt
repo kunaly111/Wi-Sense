@@ -51,7 +51,6 @@ import com.wisense.resident.presentation.MainViewModel
 fun SettingsScreen(
     viewModel: MainViewModel,
     onBack: () -> Unit,
-    onOpenStreamTest: () -> Unit,
 ) {
     val context = LocalContext.current
     val showMonitorNotification by viewModel.showMonitorNotification.collectAsStateWithLifecycle()
@@ -187,26 +186,6 @@ fun SettingsScreen(
             addCaregiverResult?.let { result ->
                 Spacer(Modifier.height(8.dp))
                 Text(result, style = MaterialTheme.typography.bodySmall)
-            }
-
-            SettingsDivider()
-
-            SectionHeader("Developer")
-
-            Text(
-                text = "Streams this phone's camera to the caregiver test app over " +
-                    "the local network, without needing a real fall trigger. The " +
-                    "real ALERT flow now streams the same way automatically — this " +
-                    "is just for testing that path without the hardware.",
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-            Spacer(Modifier.height(12.dp))
-            Button(
-                onClick = onOpenStreamTest,
-                modifier = Modifier.fillMaxWidth(),
-            ) {
-                Text("Test streaming (Phase 3)")
             }
 
             SettingsDivider()
