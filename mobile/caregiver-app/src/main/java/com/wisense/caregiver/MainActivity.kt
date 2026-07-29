@@ -1,8 +1,12 @@
 package com.wisense.caregiver
 
 import android.Manifest
+import android.app.NotificationManager
+import android.content.Intent
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -41,6 +45,24 @@ class MainActivity : ComponentActivity() {
         ) {
             registerForActivityResult(ActivityResultContracts.RequestPermission()) {}
                 .launch(Manifest.permission.RECORD_AUDIO)
+        }
+
+        // Android 14+ added a second gate on top of the USE_FULL_SCREEN_INTENT
+        // manifest permission: the user has to explicitly grant it per-app in
+        // Settings, or the alert silently degrades to a normal heads-up
+        // notification, only a Settings deep link, no runtime prompt for it.
+        if (Build.VERSION.SDK_INT >= 34) {
+            val notificationManager = getSystemService(NotificationManager::class.java)
+            if (!notificationManager.canUseFullScreenIntent()) {
+                runCatching {
+                    startActivity(
+                        Intent(
+                            Settings.ACTION_MANAGE_APP_USE_FULL_SCREEN_INTENT,
+                            Uri.parse("package:$packageName"),
+                        ),
+                    )
+                }
+            }
         }
 
         setContent {
