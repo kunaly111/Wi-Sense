@@ -73,6 +73,11 @@ fun ResidentNavHost() {
             SettingsScreen(
                 viewModel = viewModel,
                 onBack = { navController.popBackStack() },
+                onLoggedOut = {
+                    navController.navigate(Routes.AUTH) {
+                        popUpTo(navController.graph.id) { inclusive = true }
+                    }
+                },
             )
         }
         composable(Routes.EMERGENCY) {

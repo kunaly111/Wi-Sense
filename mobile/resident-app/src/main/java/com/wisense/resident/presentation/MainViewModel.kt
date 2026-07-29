@@ -15,6 +15,7 @@ import com.wisense.resident.data.house.HouseRepository
 import com.wisense.resident.data.settings.SettingsStore
 import com.wisense.resident.domain.model.BleEvent
 import com.wisense.resident.domain.model.ConnectionState
+import com.wisense.shared.firebase.AuthClient
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -101,6 +102,14 @@ class MainViewModel @Inject constructor(
 
     fun clearAddCaregiverResult() {
         _addCaregiverResult.value = null
+    }
+
+    /** Doesn't stop the monitor service — BLE monitoring is device-level, not
+     * tied to who's signed in. Clears the cached house so a different
+     * account signing in next doesn't inherit this one's house. */
+    fun logout() {
+        AuthClient.signOut()
+        settingsStore.clearHouseId()
     }
 
     fun isPaired(): Boolean =

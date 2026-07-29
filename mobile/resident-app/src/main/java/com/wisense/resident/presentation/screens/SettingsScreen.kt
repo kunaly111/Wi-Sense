@@ -13,20 +13,25 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.Logout
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -51,7 +56,9 @@ import com.wisense.resident.presentation.MainViewModel
 fun SettingsScreen(
     viewModel: MainViewModel,
     onBack: () -> Unit,
+    onLoggedOut: () -> Unit,
 ) {
+    var showLogoutConfirm by remember { mutableStateOf(false) }
     val context = LocalContext.current
     val showMonitorNotification by viewModel.showMonitorNotification.collectAsStateWithLifecycle()
     var batteryExempt by remember { mutableStateOf(context.isIgnoringBatteryOptimizations()) }
@@ -190,6 +197,19 @@ fun SettingsScreen(
 
             SettingsDivider()
 
+            SectionHeader("Account")
+
+            OutlinedButton(
+                onClick = { showLogoutConfirm = true },
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Icon(Icons.AutoMirrored.Filled.Logout, contentDescription = null, modifier = Modifier.size(18.dp))
+                Spacer(Modifier.height(0.dp))
+                Text("  Log out")
+            }
+
+            SettingsDivider()
+
             SectionHeader("About")
 
             Row(
@@ -198,13 +218,35 @@ fun SettingsScreen(
             ) {
                 Text("Version", style = MaterialTheme.typography.bodyLarge)
                 Text(
-                    text = BuildConfig.VERSION_NAME,
+                    // "-debug"/"-release" build-type suffixes are implementation
+                    // detail, not something a user needs to see.
+                    text = BuildConfig.VERSION_NAME.substringBefore("-"),
                     style = MaterialTheme.typography.bodyLarge,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
             Spacer(Modifier.height(32.dp))
         }
+    }
+
+    if (showLogoutConfirm) {
+        AlertDialog(
+            onDismissRequest = { showLogoutConfirm = false },
+            title = { Text("Log out?") },
+            text = { Text("You'll need to sign in again to keep monitoring alerts for this house.") },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        showLogoutConfirm = false
+                        viewModel.logout()
+                        onLoggedOut()
+                    },
+                ) { Text("Log out") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showLogoutConfirm = false }) { Text("Cancel") }
+            },
+        )
     }
 }
 

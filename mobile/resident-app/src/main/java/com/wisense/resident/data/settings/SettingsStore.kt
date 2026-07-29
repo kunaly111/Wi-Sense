@@ -40,6 +40,13 @@ class SettingsStore @Inject constructor(
         _houseId.value = houseId
     }
 
+    /** Logout: without this, a different account signing in on this device
+     * would inherit the previous account's cached house. */
+    fun clearHouseId() {
+        prefs.edit().remove(KEY_HOUSE_ID).apply()
+        _houseId.value = null
+    }
+
     companion object {
         private const val PREFS_NAME = "wisense_resident_settings"
         private const val KEY_SHOW_MONITOR_NOTIFICATION = "show_monitor_notification"

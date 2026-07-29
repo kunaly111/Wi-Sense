@@ -44,6 +44,14 @@
       },
       "oauth_client": [
         {
+          "client_id": "316037626448-l92j31vusmp1r3dtts4bibaunga0i5oc.apps.googleusercontent.com",
+          "client_type": 1,
+          "android_info": {
+            "package_name": "com.wisense.resident.debug",
+            "certificate_hash": "3e4a085cd5256c90f18fe0b31bae5dcf604f7f08"
+          }
+        },
+        {
           "client_id": "316037626448-fbbes76j5q5ik0j85gha33pd1io12569.apps.googleusercontent.com",
           "client_type": 3
         }
