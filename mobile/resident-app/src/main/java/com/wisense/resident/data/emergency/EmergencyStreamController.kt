@@ -3,8 +3,6 @@ package com.wisense.resident.data.emergency
 import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
-import android.hardware.camera2.CameraCharacteristics
-import android.hardware.camera2.CameraManager
 import android.util.Log
 import androidx.core.content.ContextCompat
 import com.google.firebase.firestore.FieldValue
@@ -18,6 +16,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -59,6 +58,7 @@ class EmergencyStreamController(
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private var webRtcClient: WebRtcClient? = null
     private var signalingJob: Job? = null
+    private var torchJob: Job? = null
     private var currentEmergencyId: String? = null
 
     private val _state = MutableStateFlow<EmergencyStreamState>(EmergencyStreamState.Inactive)
@@ -86,11 +86,24 @@ class EmergencyStreamController(
         }
         client.createPeerConnection(sendLocalMedia = true)
 
-        // Best-effort: WebRTC's Camera2Capturer doesn't expose torch control
-        // the way CameraX's Camera.cameraControl did. Confirmed on-device
-        // this can fail with CAMERA_IN_USE since the capturer already holds
-        // the camera open — non-fatal either way.
-        if (cameraOk) tryStart { enableTorch(true) }
+        // Two-way audio: the caregiver may talk back, and this phone is
+        // likely lying on the floor rather than held to an ear, so route
+        // to the loudspeaker instead of the earpiece.
+        tryStart { client.setSpeakerphoneOn(true) }
+
+        if (cameraOk) {
+            // client.setTorch() needs the capturer's CameraCaptureSession,
+            // which configures asynchronously (confirmed on-device: several
+            // hundred ms after startLocalCamera() returns) — retry briefly
+            // rather than giving up on the first attempt.
+            torchJob = scope.launch {
+                repeat(TORCH_RETRY_ATTEMPTS) {
+                    if (client.setTorch(true)) return@launch
+                    delay(TORCH_RETRY_DELAY_MS)
+                }
+                Log.w(TAG, "could not enable torch after $TORCH_RETRY_ATTEMPTS attempts")
+            }
+        }
 
         _state.value = EmergencyStreamState.Active(
             startedAtMillis = startedAt,
@@ -156,6 +169,8 @@ class EmergencyStreamController(
         if (!active) return
         signalingJob?.cancel()
         signalingJob = null
+        torchJob?.cancel()
+        torchJob = null
 
         currentEmergencyId?.let { id ->
             // Fire-and-forget: this scope is about to be torn down along with
@@ -166,7 +181,10 @@ class EmergencyStreamController(
         }
         currentEmergencyId = null
 
-        if (webRtcClient != null) tryStart { enableTorch(false) }
+        webRtcClient?.let { client ->
+            tryStart { client.setTorch(false) }
+            tryStart { client.setSpeakerphoneOn(false) }
+        }
         webRtcClient?.release()
         webRtcClient = null
         _localVideoTrack.value = null
@@ -177,15 +195,6 @@ class EmergencyStreamController(
     private fun setCaregiverConnected(connected: Boolean) {
         val current = _state.value as? EmergencyStreamState.Active ?: return
         _state.value = current.copy(caregiverConnected = connected)
-    }
-
-    private fun enableTorch(enabled: Boolean) {
-        val cameraManager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
-        val cameraId = cameraManager.cameraIdList.firstOrNull { id ->
-            cameraManager.getCameraCharacteristics(id).get(CameraCharacteristics.LENS_FACING) ==
-                CameraCharacteristics.LENS_FACING_BACK
-        } ?: cameraManager.cameraIdList.firstOrNull() ?: return
-        cameraManager.setTorchMode(cameraId, enabled)
     }
 
     private fun hasPermission(permission: String): Boolean =
@@ -201,5 +210,7 @@ class EmergencyStreamController(
 
     companion object {
         private const val TAG = "EmergencyStreamController"
+        private const val TORCH_RETRY_ATTEMPTS = 10
+        private const val TORCH_RETRY_DELAY_MS = 200L
     }
 }

@@ -1,7 +1,10 @@
 package com.wisense.caregiver.presentation
 
+import android.Manifest
 import android.app.Application
+import android.content.pm.PackageManager
 import android.util.Log
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.google.firebase.firestore.FirebaseFirestore
@@ -97,6 +100,12 @@ class ViewerViewModel(application: Application) : AndroidViewModel(application) 
 
         val client = WebRtcClient(getApplication())
         webRtcClient = client
+        // Two-way audio: mic permission may be denied, in which case this
+        // just no-ops and the connection stays receive-only for audio too —
+        // never blocks video from working.
+        if (hasRecordAudioPermission()) client.startLocalAudio()
+        // Watching the video while talking, not holding the phone to an ear.
+        client.setSpeakerphoneOn(true)
 
         negotiationJob = viewModelScope.launch {
             launch {
@@ -108,7 +117,12 @@ class ViewerViewModel(application: Application) : AndroidViewModel(application) 
                 }
             }
             try {
-                client.createPeerConnection(sendLocalMedia = false)
+                // true here doesn't mean "send camera" (no local video track
+                // was ever started) — it means "attach whatever local tracks
+                // exist," which after startLocalAudio() above is just mic
+                // audio, giving a bidirectional audio / receive-only video
+                // connection.
+                client.createPeerConnection(sendLocalMedia = true)
                 Log.d(TAG, "waiting for offer on $emergencyId")
                 val offer = FirestoreSignaling.awaitMessage(emergencyId, "offer")
                 check(offer is SignalingMessage.Offer) { "expected an offer, got ${offer.type}" }
@@ -132,6 +146,7 @@ class ViewerViewModel(application: Application) : AndroidViewModel(application) 
         negotiationJob?.cancel()
         negotiationJob = null
         negotiatingEmergencyId = null
+        webRtcClient?.let { client -> runCatching { client.setSpeakerphoneOn(false) } }
         webRtcClient?.release()
         webRtcClient = null
         _uiState.value = ViewerUiState.Waiting
@@ -139,9 +154,14 @@ class ViewerViewModel(application: Application) : AndroidViewModel(application) 
 
     override fun onCleared() {
         negotiationJob?.cancel()
+        webRtcClient?.let { client -> runCatching { client.setSpeakerphoneOn(false) } }
         webRtcClient?.release()
         super.onCleared()
     }
+
+    private fun hasRecordAudioPermission(): Boolean =
+        ContextCompat.checkSelfPermission(getApplication(), Manifest.permission.RECORD_AUDIO) ==
+            PackageManager.PERMISSION_GRANTED
 
     companion object {
         private const val TAG = "ViewerViewModel"

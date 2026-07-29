@@ -33,6 +33,16 @@ class MainActivity : ComponentActivity() {
                 .launch(Manifest.permission.POST_NOTIFICATIONS)
         }
 
+        // For two-way audio: without this, startLocalAudio() in negotiate()
+        // silently captures no mic input rather than crashing, so a denial
+        // here just means the caregiver can't be heard, not a hard failure.
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) !=
+            android.content.pm.PackageManager.PERMISSION_GRANTED
+        ) {
+            registerForActivityResult(ActivityResultContracts.RequestPermission()) {}
+                .launch(Manifest.permission.RECORD_AUDIO)
+        }
+
         setContent {
             MaterialTheme {
                 Surface {

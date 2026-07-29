@@ -1,6 +1,13 @@
 package com.wisense.shared.webrtc
 
 import android.content.Context
+import android.hardware.camera2.CameraCaptureSession
+import android.hardware.camera2.CameraDevice
+import android.hardware.camera2.CaptureRequest
+import android.media.AudioDeviceInfo
+import android.media.AudioManager
+import android.os.Build
+import android.view.Surface
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -87,7 +94,11 @@ class WebRtcClient(private val context: Context) {
         return track
     }
 
-    /** Resident side only: opens the mic and starts a local audio track. */
+    /**
+     * Opens the mic and starts a local audio track. Used by the resident
+     * (camera+mic) and, for two-way audio, the caregiver too (mic only —
+     * it never calls [startLocalCamera]).
+     */
     fun startLocalAudio(): AudioTrack {
         val audioSource = peerConnectionFactory.createAudioSource(MediaConstraints())
         val track = peerConnectionFactory.createAudioTrack("wisense_audio", audioSource)
@@ -96,9 +107,11 @@ class WebRtcClient(private val context: Context) {
     }
 
     /**
-     * [sendLocalMedia] true for the resident (attaches camera+mic tracks
-     * started above), false for the caregiver (receive-only — remote video
-     * arrives via [remoteVideoTrack]).
+     * [sendLocalMedia] attaches whichever local tracks were already started
+     * above (addTrack is a no-op for a track that was never started) — true
+     * for the resident (camera+mic) and, since two-way audio, also true for
+     * the caregiver (mic only, no camera track exists). Remote video always
+     * arrives via [remoteVideoTrack] regardless of this flag.
      */
     fun createPeerConnection(sendLocalMedia: Boolean) {
         // No STUN server: confirmed on-device that gathering never completed
@@ -186,6 +199,76 @@ class WebRtcClient(private val context: Context) {
         withTimeout(ICE_GATHERING_TIMEOUT_MS) { deferred.await() }
     }
 
+    /**
+     * Keeps the flash on for the whole stream, not just a moment before it.
+     * There is no public API for this: [CameraVideoCapturer]/Camera2Session
+     * expose no torch control at all (confirmed by inspecting the
+     * stream-webrtc-android 1.3.10 classes directly), and
+     * CameraManager.setTorchMode() only works when no app holds the camera
+     * device open — which our own capture session does, and opening that
+     * session is documented to force any prior torch-mode state off anyway.
+     * The only way to keep it on *during* capture is to resubmit the
+     * repeating request that's actually driving the camera with
+     * FLASH_MODE_TORCH added, which means reaching into the capturer's
+     * private CameraDevice/CameraCaptureSession/Surface via reflection.
+     * Every step is best-effort: returns false (never throws) the moment
+     * anything doesn't match what this library version's internals look
+     * like, e.g. after a future stream-webrtc-android upgrade renames a
+     * field — silently losing the flash is fine, silently breaking the
+     * actual video/audio capture never is.
+     */
+    fun setTorch(enabled: Boolean): Boolean = try {
+        val session = videoCapturer?.getPrivateField("currentSession")
+        if (session == null || session.javaClass.simpleName != "Camera2Session") {
+            false
+        } else {
+            val cameraDevice = session.getPrivateField("cameraDevice") as? CameraDevice
+            val captureSession = session.getPrivateField("captureSession") as? CameraCaptureSession
+            val surface = session.getPrivateField("surface") as? Surface
+            if (cameraDevice == null || captureSession == null || surface == null) {
+                false
+            } else {
+                val request = cameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
+                    addTarget(surface)
+                    set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
+                    set(
+                        CaptureRequest.FLASH_MODE,
+                        if (enabled) CaptureRequest.FLASH_MODE_TORCH else CaptureRequest.FLASH_MODE_OFF,
+                    )
+                }
+                captureSession.setRepeatingRequest(request.build(), null, null)
+                true
+            }
+        }
+    } catch (e: Exception) {
+        false
+    }
+
+    /**
+     * Both apps use this — neither side of a call is holding the phone to
+     * an ear (resident's is likely on the floor, caregiver wants to watch
+     * the video while talking). On API 31+ the deprecated
+     * isSpeakerphoneOn flag is unreliable on some OEM skins once a call is
+     * actually routing audio, so prefer setCommunicationDevice() there and
+     * only fall back to the old flag on older API levels.
+     */
+    fun setSpeakerphoneOn(on: Boolean) {
+        val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        audioManager.mode = if (on) AudioManager.MODE_IN_COMMUNICATION else AudioManager.MODE_NORMAL
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            if (on) {
+                val speaker = audioManager.availableCommunicationDevices
+                    .firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER }
+                if (speaker != null) audioManager.setCommunicationDevice(speaker)
+            } else {
+                audioManager.clearCommunicationDevice()
+            }
+        } else {
+            @Suppress("DEPRECATION")
+            audioManager.isSpeakerphoneOn = on
+        }
+    }
+
     fun release() {
         runCatching { videoCapturer?.stopCapture() }
         videoCapturer?.dispose()
@@ -261,3 +344,16 @@ private suspend fun PeerConnection.setRemoteDescriptionSuspend(sdp: SessionDescr
             sdp,
         )
     }
+
+/** Walks up the class hierarchy since a field may be declared on a superclass. */
+private fun Any.getPrivateField(name: String): Any? {
+    var cls: Class<*>? = javaClass
+    while (cls != null) {
+        try {
+            return cls.getDeclaredField(name).apply { isAccessible = true }.get(this)
+        } catch (e: NoSuchFieldException) {
+            cls = cls.superclass
+        }
+    }
+    return null
+}
