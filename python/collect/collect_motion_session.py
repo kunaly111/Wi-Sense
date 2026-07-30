@@ -100,6 +100,10 @@ def main():
                         help='Start at activity slug, e.g. pace_bed_door')
     parser.add_argument('--resume', action='store_true',
                         help='Auto-start at first activity with fewer than 8 CSV files')
+    parser.add_argument('--environment-notes', default='',
+                        help='Free-text note on physical room state for this session '
+                             '(e.g. "bag near TX removed") — recorded in every activity\'s '
+                             'manifest and the master session log.')
     args = parser.parse_args()
 
     start_activity = resolve_start_activity(args)
@@ -144,6 +148,8 @@ def main():
     with master_log.open('w') as master_handle:
         master_handle.write(f'started={dt.datetime.now().isoformat()}\n')
         master_handle.write(f'start_activity={start_activity}\n')
+        if args.environment_notes:
+            master_handle.write(f'environment_notes={args.environment_notes}\n')
 
         for activity_idx in range(start_activity - 1, len(MOTION_ACTIVITIES)):
             activity, label, instruction = MOTION_ACTIVITIES[activity_idx]
@@ -170,6 +176,7 @@ def main():
                 expected_mac=args.expected_mac,
                 activity_label=label,
                 ready_sec=args.ready_sec,
+                environment_notes=args.environment_notes,
             )
 
             master_handle.write(

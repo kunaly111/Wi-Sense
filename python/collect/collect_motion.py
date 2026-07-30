@@ -6,6 +6,7 @@
 import argparse
 import csv
 import datetime as dt
+import json
 import re
 import subprocess
 import sys
@@ -17,6 +18,9 @@ if str(_PYTHON_ROOT) not in sys.path:
     sys.path.insert(0, str(_PYTHON_ROOT))
 
 from paths import CAPTURE_SCRIPT, PYTHON_ROOT, RAW_ROOT
+from collect.validate_csi_captures import audit_file
+
+DEFAULT_MIN_CAPTURE_PACKETS = 2000
 
 DATASET_ROOT = RAW_ROOT / 'motion'
 
@@ -123,7 +127,31 @@ def count_data_rows(csv_path):
     return max(0, rows - 1)
 
 
+def stats_path_for(csv_path):
+    return csv_path.with_suffix('.stats.json')
+
+
+def read_stats_json(stats_path):
+    """Read the transport-quality stats capture_csi_binary.py writes via
+    --stats-out (resync/tx-missing/uart-missing counters). Returns {} if the
+    capture failed before writing it or used an older script version."""
+    if not stats_path.exists():
+        return {}
+    try:
+        return json.loads(stats_path.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def audit_capture(csv_path, min_raw_packets=DEFAULT_MIN_CAPTURE_PACKETS):
+    """Preprocessing-level quality check (drop_pct/kept_packets/status) —
+    same logic collect_empty_room.py already uses. Recorded in the manifest
+    only, not acted on: no auto-quarantine here."""
+    return audit_file(csv_path, min_raw=min_raw_packets)
+
+
 def run_capture_window(port, baud, csv_path, log_path, window_sec, expected_len, expected_mac):
+    stats_path = stats_path_for(csv_path)
     cmd = [
         sys.executable,
         str(CAPTURE_SCRIPT),
@@ -135,14 +163,16 @@ def run_capture_window(port, baud, csv_path, log_path, window_sec, expected_len,
         '--expected-mac', expected_mac,
         '--report-interval', '30',
         '--duration', str(window_sec),
+        '--stats-out', str(stats_path),
     ]
     print(f'  running capture for {window_sec}s')
-    return subprocess.run(cmd, cwd=str(PYTHON_ROOT), check=False).returncode
+    exit_code = subprocess.run(cmd, cwd=str(PYTHON_ROOT), check=False).returncode
+    return exit_code, read_stats_json(stats_path)
 
 
 def append_manifest(manifest_path, row):
     write_header = not manifest_path.exists()
-    with manifest_path.open('a', newline='') as handle:
+    with manifest_path.open('a', newline='', encoding='utf-8') as handle:
         writer = csv.DictWriter(handle, fieldnames=row.keys())
         if write_header:
             writer.writeheader()
@@ -178,6 +208,7 @@ def run_activity_session(
     start_serial=0,
     activity_label='',
     ready_sec=0,
+    environment_notes='',
 ):
     activity = normalize_activity(activity)
     dataset_dir = Path(dataset_dir) if dataset_dir else DATASET_ROOT / activity
@@ -205,11 +236,13 @@ def run_activity_session(
     if ready_sec > 0:
         countdown(ready_sec, f'Get in starting position — {ready_sec}s until first recording.')
 
-    with session_log.open('w') as log_handle:
+    with session_log.open('w', encoding='utf-8') as log_handle:
         log_handle.write(f'label=motion\nactivity={activity}\n')
         log_handle.write(f'instruction={instruction}\n')
         if activity_label:
             log_handle.write(f'activity_label={activity_label}\n')
+        if environment_notes:
+            log_handle.write(f'environment_notes={environment_notes}\n')
         log_handle.write(f'started={dt.datetime.now().isoformat()}\n')
         log_handle.write(f'windows={total_windows}\n')
 
@@ -226,7 +259,7 @@ def run_activity_session(
             beep_record_start()
 
             window_start = time.time()
-            exit_code = run_capture_window(
+            exit_code, capture_stats = run_capture_window(
                 port,
                 baud,
                 csv_path,
@@ -236,6 +269,7 @@ def run_activity_session(
                 expected_mac,
             )
             packet_count = count_data_rows(csv_path)
+            quality = audit_capture(csv_path)
 
             append_manifest(manifest_path, {
                 'window': window_idx,
@@ -245,10 +279,19 @@ def run_activity_session(
                 'activity': activity,
                 'activity_label': activity_label,
                 'instruction': instruction,
+                'environment_notes': environment_notes,
                 'started_at': dt.datetime.fromtimestamp(window_start).isoformat(timespec='seconds'),
                 'duration_sec': round(time.time() - window_start, 1),
                 'packets': packet_count,
                 'capture_exit_code': exit_code,
+                'quality': quality['status'],
+                'drop_pct': quality.get('drop_pct', 0.0),
+                'kept_packets': quality.get('kept_packets', packet_count),
+                'resync_bytes': capture_stats.get('resync_bytes', ''),
+                'tx_missing_pct': capture_stats.get('tx_missing_pct', ''),
+                'tx_resets': capture_stats.get('tx_resets', ''),
+                'uart_missing_pct': capture_stats.get('uart_missing_pct', ''),
+                'uart_resets': capture_stats.get('uart_resets', ''),
             })
 
             print(f'  saved {packet_count} packets -> {csv_path.name}')
@@ -294,6 +337,10 @@ def main():
                         help='Force first serial number (0 = auto)')
     parser.add_argument('--ready-sec', type=int, default=DEFAULT_READY_SEC,
                         help='Countdown before first window (default 20s)')
+    parser.add_argument('--environment-notes', default='',
+                        help='Free-text note on physical room state for this session '
+                             '(e.g. "bag near TX removed") — recorded in the manifest '
+                             'and session log since it cannot be reconstructed later.')
     args = parser.parse_args()
 
     activity = normalize_activity(args.activity)
@@ -316,6 +363,7 @@ def main():
         expected_mac=args.expected_mac,
         start_serial=args.start_serial,
         ready_sec=args.ready_sec,
+        environment_notes=args.environment_notes,
     )
     return 0
 

@@ -1,7 +1,33 @@
 # This file was generated using idf.py save-defconfig. It can be edited manually.
 # Espressif IoT Development Framework (ESP-IDF) 5.5.0 Project Minimal Configuration
 #
+# Board is ESP32-S3-DevKitC-1 N16R8 (16MB flash, confirmed via
+# `esptool.py flash_id` — see docs/handoff.md history). Without an explicit
+# override IDF defaults new projects to 2MB, which silently wastes 14MB of
+# real flash and left almost no partition headroom. Custom table below gives
+# the app a 4MB single-app partition (was IDF's default 1MB, already ~96%
+# full before adding any TinyML runtime) with plenty of the 16MB left
+# unallocated for a future OTA/model partition.
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_PARTITION_TABLE_FILENAME="partitions.csv"
 CONFIG_PARTITION_TABLE_OFFSET=0xa000
+
+# Default log level is INFO, and ~55 ESP_LOG* call sites across the
+# peripheral stack (fall countdown, light/relay, BLE, OLED) fire during
+# normal operation — including once per second for the entire 15s fall
+# countdown. Those log lines and the binary CSI stream share the same
+# USB-Serial-JTAG channel (this board has no secondary console, see below),
+# so keeping them at ERROR by default removes the dominant source of CSI
+# frame corruption during exactly the capture sessions that matter most
+# (Fall, and every class-transition boundary). The csi_console_vprintf
+# mutex in app_main.c is a second, independent layer of protection for
+# whatever still logs at ERROR (or if this is temporarily raised for
+# debugging).
+CONFIG_LOG_DEFAULT_LEVEL_ERROR=y
+CONFIG_LOG_DEFAULT_LEVEL=1
 
 # This board (ESP32-S3-DevKitC-1) has no external USB-UART bridge on UART0
 # (GPIO43/44 are unconnected) — only the native USB-Serial/JTAG peripheral

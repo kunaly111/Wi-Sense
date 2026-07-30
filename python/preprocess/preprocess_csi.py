@@ -9,6 +9,7 @@ low enough for ~8 GB laptops (one file in memory at a time).
 
 import argparse
 import csv
+import datetime as dt
 import gc
 import json
 import re
@@ -98,9 +99,11 @@ MAX_TIMESTAMP_DURATION_SEC = 300.0
 
 BASELINE_MODE_PER_FILE = 'per_file'
 BASELINE_MODE_EMPTY_REF = 'empty_room_reference'
-DEFAULT_BASELINE_MODE = BASELINE_MODE_EMPTY_REF
+BASELINE_MODE_SESSION_MATCH = 'session_match'
+DEFAULT_BASELINE_MODE = BASELINE_MODE_SESSION_MATCH
 
 SESSION_CSV_RE = re.compile(r'_(session|full_session)_', re.I)
+FILENAME_DATE_RE = re.compile(r'(20\d{6})_\d{6}')
 
 ARRAY_SPECS = {
     'X_feat': ('float32', (FEATURE_DIM,)),
@@ -504,6 +507,19 @@ def iter_empty_reference_paths(empty_dir):
             yield path
 
 
+def compute_reference_baseline_for_paths(paths, expected_mac=EXPECTED_MAC, context_label=''):
+    """Build a reference spectrum (median-of-medians) from an explicit path list."""
+    file_medians = []
+    for path in paths:
+        matrix = load_csv_packets(path, expected_mac=expected_mac)
+        if matrix.size == 0:
+            continue
+        file_medians.append(np.median(matrix, axis=0))
+    if not file_medians:
+        raise RuntimeError(f'no empty reference files found in {context_label or paths}')
+    return np.median(np.stack(file_medians, axis=0), axis=0).astype(np.float32)
+
+
 def compute_reference_baseline(empty_dir, expected_mac=EXPECTED_MAC, prefer_live=True):
     """Build room-empty reference spectrum from empty_fan_on captures.
 
@@ -515,15 +531,86 @@ def compute_reference_baseline(empty_dir, expected_mac=EXPECTED_MAC, prefer_live
         live_paths = [p for p in paths if p.name.startswith('live_empty_')]
         if live_paths:
             paths = live_paths
-    file_medians = []
-    for path in paths:
-        matrix = load_csv_packets(path, expected_mac=expected_mac)
-        if matrix.size == 0:
+    return compute_reference_baseline_for_paths(paths, expected_mac, context_label=str(empty_dir))
+
+
+def _date_from_sibling_manifest(path):
+    """Resolve a capture file's recording date via a sibling manifest CSV.
+
+    Manifests are identified structurally (has 'file' and 'started_at'
+    columns), not by filename, since naming varies by capture type
+    (empty_session_*, presence_*, motion_*, fall_*).
+    """
+    for manifest in sorted(path.parent.glob('*.csv')):
+        if manifest == path:
             continue
-        file_medians.append(np.median(matrix, axis=0))
-    if not file_medians:
-        raise RuntimeError(f'no empty reference files found in {empty_dir}')
-    return np.median(np.stack(file_medians, axis=0), axis=0).astype(np.float32)
+        try:
+            with manifest.open(newline='', encoding='utf-8', errors='replace') as handle:
+                reader = csv.DictReader(handle)
+                fieldnames = reader.fieldnames or []
+                if 'file' not in fieldnames or 'started_at' not in fieldnames:
+                    continue
+                for row in reader:
+                    if row.get('file') != path.name:
+                        continue
+                    try:
+                        return dt.datetime.fromisoformat(row.get('started_at', '')).date()
+                    except ValueError:
+                        return None
+        except (OSError, csv.Error):
+            continue
+    return None
+
+
+def capture_date_for_file(path):
+    """Resolve a capture file's recording date.
+
+    Order: date embedded in the filename (live_empty_*), else a sibling
+    manifest CSV lookup (s*.csv files, which don't embed a date), else the
+    file's mtime as a low-confidence last resort. Returns None if nothing
+    resolves.
+    """
+    path = Path(path)
+    match = FILENAME_DATE_RE.search(path.name)
+    if match:
+        try:
+            return dt.datetime.strptime(match.group(1), '%Y%m%d').date()
+        except ValueError:
+            pass
+    manifest_date = _date_from_sibling_manifest(path)
+    if manifest_date is not None:
+        return manifest_date
+    try:
+        return dt.datetime.fromtimestamp(path.stat().st_mtime).date()
+    except OSError:
+        return None
+
+
+def group_empty_paths_by_date(empty_dir):
+    """Bucket empty-room reference paths (excludes quarantine) by recording date."""
+    groups = {}
+    for path in iter_empty_reference_paths(empty_dir):
+        date = capture_date_for_file(path)
+        if date is None:
+            continue
+        groups.setdefault(date, []).append(path)
+    return groups
+
+
+def resolve_session_baseline(file_path, global_baseline, empty_by_date, expected_mac=EXPECTED_MAC, cache=None):
+    """Per-file baseline for session_match mode: same-day empty reference if
+    one exists, else the global reference. Returns (baseline, source_label)."""
+    if cache is None:
+        cache = {}
+    date = capture_date_for_file(file_path)
+    same_day_paths = empty_by_date.get(date) if date is not None else None
+    if not same_day_paths:
+        return global_baseline, 'global'
+    if date not in cache:
+        cache[date] = compute_reference_baseline_for_paths(
+            same_day_paths, expected_mac, context_label=f'session {date}',
+        )
+    return cache[date], f'session:{date.isoformat()}'
 
 
 def load_csv_amplitudes(csv_path, expected_mac=EXPECTED_MAC, reference_baseline=None):
@@ -541,7 +628,7 @@ def load_fall_metadata(fall_dir=FALL_DIR):
     for manifest in fall_dir.glob('**/fall_*.csv'):
         if not manifest.is_file():
             continue
-        with manifest.open(newline='') as handle:
+        with manifest.open(newline='', encoding='utf-8', errors='replace') as handle:
             reader = csv.DictReader(handle)
             for row in reader:
                 fname = row.get('file', '').strip()
@@ -593,6 +680,8 @@ def discover_capture_files(empty_source='all'):
         if not root.exists():
             continue
         for path in sorted(root.glob('**/s*.csv')):
+            if 'quarantine' in path.parts:
+                continue
             if SESSION_CSV_RE.search(path.name):
                 continue
             if path.name.startswith('motion_') or path.name.startswith('presence_'):
@@ -605,6 +694,8 @@ def discover_capture_files(empty_source='all'):
     fall_meta = load_fall_metadata()
     if FALL_DIR.exists():
         for path in sorted(FALL_DIR.glob('**/s*.csv')):
+            if 'quarantine' in path.parts:
+                continue
             if SESSION_CSV_RE.search(path.name):
                 continue
             if '_fall_' not in path.name:
@@ -978,7 +1069,8 @@ def merge_shards_into_memmap(shard_paths, tmp_dir, total_windows):
 
 
 def build_split_memmap(file_entries, tmp_dir, split_name, file_id_offset=0,
-                       reference_baseline=None):
+                       baseline_mode=BASELINE_MODE_EMPTY_REF, global_baseline=None,
+                       empty_by_date=None, expected_mac=EXPECTED_MAC):
     """Process files incrementally via per-file shards, then merge to memmap."""
     tmp_dir = Path(tmp_dir)
     shard_dir = tmp_dir / 'shards'
@@ -988,9 +1080,26 @@ def build_split_memmap(file_entries, tmp_dir, split_name, file_id_offset=0,
     n_files = len(file_entries)
     shard_paths = []
     total_windows = 0
+    session_baseline_cache = {}
 
     for local_id, entry in enumerate(file_entries):
         file_id = file_id_offset + local_id
+        if baseline_mode == BASELINE_MODE_SESSION_MATCH:
+            # Fall was briefly excluded here (its ~650 positive windows make a
+            # retrain comparison hard to read). Re-included 2026-07-30: live
+            # inference calibrates its baseline against the CURRENT empty room,
+            # so fall captures must be baselined against their own same-day
+            # empty reference too, or training and live see different feature
+            # spaces — which is exactly what kept live fall detection from
+            # firing.
+            reference_baseline, baseline_source = resolve_session_baseline(
+                entry['path'], global_baseline, empty_by_date or {},
+                expected_mac, cache=session_baseline_cache,
+            )
+        elif baseline_mode in (BASELINE_MODE_EMPTY_REF, BASELINE_MODE_SESSION_MATCH):
+            reference_baseline, baseline_source = global_baseline, 'global'
+        else:
+            reference_baseline, baseline_source = None, 'per_file'
         windows, n_packets, sample_rate, file_stats = process_file(
             entry, reference_baseline=reference_baseline,
         )
@@ -1041,6 +1150,7 @@ def build_split_memmap(file_entries, tmp_dir, split_name, file_id_offset=0,
             'packets': n_packets,
             'sample_rate_hz': round(sample_rate, 2),
             'windows': n_file_windows,
+            'baseline_source': baseline_source,
         })
 
         print(
@@ -1127,9 +1237,15 @@ def main():
     parser.add_argument('--seed', type=int, default=42, help='Random seed for split')
     parser.add_argument(
         '--baseline-mode',
-        choices=(BASELINE_MODE_PER_FILE, BASELINE_MODE_EMPTY_REF),
+        choices=(BASELINE_MODE_PER_FILE, BASELINE_MODE_EMPTY_REF, BASELINE_MODE_SESSION_MATCH),
         default=DEFAULT_BASELINE_MODE,
-        help='Baseline subtraction mode (default: empty_room_reference for live deploy)',
+        help=(
+            'Baseline subtraction mode (default: session_match — same-day '
+            'empty-room reference per file when one exists, else falls back '
+            'to the global reference; validated 2026-07-30, see docs/csi.md '
+            '§4.1). empty_room_reference: single global reference for every '
+            'file, as used before that date.'
+        ),
     )
     parser.add_argument(
         '--classes',
@@ -1179,17 +1295,23 @@ def main():
     print(f'Train files: {len(train_files)} | Val files: {len(val_files)}')
     print(f'Baseline mode: {args.baseline_mode}')
 
-    reference_baseline = None
-    if args.baseline_mode == BASELINE_MODE_EMPTY_REF:
-        reference_baseline = compute_reference_baseline(EMPTY_DIR)
+    global_baseline = None
+    empty_by_date = None
+    if args.baseline_mode in (BASELINE_MODE_EMPTY_REF, BASELINE_MODE_SESSION_MATCH):
+        global_baseline = compute_reference_baseline(EMPTY_DIR)
         print(f'Empty-room reference baseline computed from {EMPTY_DIR.name}')
+    if args.baseline_mode == BASELINE_MODE_SESSION_MATCH:
+        empty_by_date = group_empty_paths_by_date(EMPTY_DIR)
+        print(f'Empty-room dates available for session matching: '
+              f'{sorted(d.isoformat() for d in empty_by_date)}')
     print()
 
     print('Processing train split...')
     train_tmp = OUTPUT_ROOT / '.memmap_train'
     train_maps, train_manifest, train_n = build_split_memmap(
         train_files, train_tmp, 'train', file_id_offset=0,
-        reference_baseline=reference_baseline,
+        baseline_mode=args.baseline_mode, global_baseline=global_baseline,
+        empty_by_date=empty_by_date,
     )
     print('Saving train.npz...')
     train_path = OUTPUT_ROOT / 'train.npz'
@@ -1202,7 +1324,8 @@ def main():
     val_tmp = OUTPUT_ROOT / '.memmap_val'
     val_maps, val_manifest, val_n = build_split_memmap(
         val_files, val_tmp, 'val', file_id_offset=len(train_files),
-        reference_baseline=reference_baseline,
+        baseline_mode=args.baseline_mode, global_baseline=global_baseline,
+        empty_by_date=empty_by_date,
     )
     print('Saving val.npz...')
     val_path = OUTPUT_ROOT / 'val.npz'
@@ -1251,8 +1374,8 @@ def main():
             'max_missing_packets_per_window_gap': MAX_MISSING_PACKETS_PER_WINDOW_GAP,
         },
     }
-    if reference_baseline is not None:
-        config['reference_baseline'] = reference_baseline.tolist()
+    if global_baseline is not None:
+        config['reference_baseline'] = global_baseline.tolist()
     try:
         config['fall_dir'] = str(FALL_DIR.relative_to(DATASET_ROOT))
     except ValueError:

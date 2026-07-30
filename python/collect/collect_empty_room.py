@@ -6,6 +6,7 @@
 import argparse
 import csv
 import datetime as dt
+import json
 import subprocess
 import sys
 import time
@@ -79,7 +80,24 @@ def audit_capture(csv_path, min_raw_packets=DEFAULT_MIN_CAPTURE_PACKETS):
     return audit_file(csv_path, min_raw=min_raw_packets)
 
 
+def stats_path_for(csv_path):
+    return csv_path.with_suffix('.stats.json')
+
+
+def read_stats_json(stats_path):
+    """Read the transport-quality stats capture_csi_binary.py writes via
+    --stats-out (resync/tx-missing/uart-missing counters). Returns {} if the
+    capture failed before writing it or used an older script version."""
+    if not stats_path.exists():
+        return {}
+    try:
+        return json.loads(stats_path.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
 def run_capture_window(port, baud, csv_path, log_path, window_sec, expected_len, expected_mac):
+    stats_path = stats_path_for(csv_path)
     cmd = [
         sys.executable,
         str(CAPTURE_SCRIPT),
@@ -91,15 +109,16 @@ def run_capture_window(port, baud, csv_path, log_path, window_sec, expected_len,
         '--expected-mac', expected_mac,
         '--report-interval', '30',
         '--duration', str(window_sec),
+        '--stats-out', str(stats_path),
     ]
     print(f'  running capture for {window_sec}s')
     result = subprocess.run(cmd, cwd=str(PYTHON_ROOT), check=False)
-    return result.returncode
+    return result.returncode, read_stats_json(stats_path)
 
 
 def append_manifest(manifest_path, row):
     write_header = not manifest_path.exists()
-    with manifest_path.open('a', newline='') as handle:
+    with manifest_path.open('a', newline='', encoding='utf-8') as handle:
         writer = csv.DictWriter(handle, fieldnames=row.keys())
         if write_header:
             writer.writeheader()
@@ -154,6 +173,10 @@ def main():
                         help='Move failed quality checks to quarantine/ (default on)')
     parser.add_argument('--keep-bad', action='store_true',
                         help='Keep failed captures in dataset dir (disable quarantine)')
+    parser.add_argument('--environment-notes', default='',
+                        help='Free-text note on physical room state for this session '
+                             '(e.g. "bag near TX removed") — recorded in the manifest '
+                             'and session log since it cannot be reconstructed later.')
     args = parser.parse_args()
     if args.keep_bad:
         args.quarantine_bad = False
@@ -195,9 +218,11 @@ def main():
     print()
 
     session_start = time.time()
-    with session_log.open('w') as log_handle:
+    with session_log.open('w', encoding='utf-8') as log_handle:
         log_handle.write(f'started={dt.datetime.now().isoformat()}\n')
         log_handle.write(f'environment={environment}\n')
+        if args.environment_notes:
+            log_handle.write(f'environment_notes={args.environment_notes}\n')
         log_handle.write(f'port={args.port}\n')
         log_handle.write(f'windows={total_windows}\n')
         wait_exit_grace(args.exit_grace_sec, log_handle)
@@ -218,7 +243,7 @@ def main():
             beep(times=2)
 
             window_start = time.time()
-            exit_code = run_capture_window(
+            exit_code, capture_stats = run_capture_window(
                 args.port,
                 args.baud,
                 csv_path,
@@ -236,7 +261,7 @@ def main():
             if quality_status == 'fail' and args.quarantine_bad:
                 qdir = dataset_dir / 'quarantine'
                 qdir.mkdir(parents=True, exist_ok=True)
-                for src in (csv_path, log_path):
+                for src in (csv_path, log_path, stats_path_for(csv_path)):
                     if src.exists():
                         dst = qdir / src.name
                         if dst.exists():
@@ -260,6 +285,7 @@ def main():
                 'serial': serial_no,
                 'label': 'empty',
                 'environment': environment,
+                'environment_notes': args.environment_notes,
                 'started_at': dt.datetime.fromtimestamp(window_start).isoformat(timespec='seconds'),
                 'duration_sec': round(window_elapsed, 1),
                 'packets': packet_count,
@@ -267,6 +293,11 @@ def main():
                 'quality': quality_status,
                 'drop_pct': quality.get('drop_pct', 0.0),
                 'kept_packets': quality.get('kept_packets', packet_count),
+                'resync_bytes': capture_stats.get('resync_bytes', ''),
+                'tx_missing_pct': capture_stats.get('tx_missing_pct', ''),
+                'tx_resets': capture_stats.get('tx_resets', ''),
+                'uart_missing_pct': capture_stats.get('uart_missing_pct', ''),
+                'uart_resets': capture_stats.get('uart_resets', ''),
             })
 
             qual_note = ''

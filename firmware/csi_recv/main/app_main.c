@@ -15,9 +15,19 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdarg.h>
+#include <inttypes.h>
+#include <errno.h>
 #include <unistd.h>
 
 #include "nvs_flash.h"
+#include "driver/usb_serial_jtag_vfs.h"
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+#include "freertos/semphr.h"
+#include "esp_timer.h"
 
 #include "esp_mac.h"
 #include "esp_log.h"
@@ -35,9 +45,9 @@
 
 #include "emergency_rx.h"
 
-_Static_assert(sizeof(csi_binary_header_t) == 4, "csi_binary_header_t size mismatch");
-_Static_assert(sizeof(csi_binary_legacy_payload_t) == 804, "csi_binary_legacy_payload_t size mismatch");
-_Static_assert(sizeof(csi_binary_c5c6_payload_t) == 794, "csi_binary_c5c6_payload_t size mismatch");
+_Static_assert(sizeof(csi_binary_header_t) == 12, "csi_binary_header_t size mismatch");
+_Static_assert(sizeof(csi_binary_legacy_payload_t) == 805, "csi_binary_legacy_payload_t size mismatch");
+_Static_assert(sizeof(csi_binary_c5c6_payload_t) == 795, "csi_binary_c5c6_payload_t size mismatch");
 
 #define CONFIG_LESS_INTERFERENCE_CHANNEL   11
 #if CONFIG_IDF_TARGET_ESP32C5 || CONFIG_IDF_TARGET_ESP32C61 || (CONFIG_IDF_TARGET_ESP32C6 && ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 4, 0))
@@ -147,14 +157,88 @@ static void wifi_esp_now_init(esp_now_peer_info_t peer)
 
 }
 
+/*
+ * The binary CSI stream and ESP_LOG both go out over the single native
+ * USB-Serial-JTAG peripheral on this board (no secondary console). Two
+ * problems that used to exist here:
+ *   1. A log line from another task (fall countdown, light/OLED/BLE
+ *      transitions) could interleave mid-frame, since header+payload were
+ *      two separate unsynchronized write() calls.
+ *   2. csi_binary_write() ran synchronously inside wifi_csi_rx_cb (WiFi
+ *      task context) — a slow/stalled USB host backpressured directly into
+ *      CSI capture.
+ * Fixed by: building each frame into one contiguous buffer, handing it to a
+ * dedicated writer task over a queue (non-blocking send — a full queue
+ * drops the newest frame and counts it, never blocks the CSI callback), and
+ * routing all ESP_LOG output through the same mutex the writer task uses
+ * for its write(), so a log line and a CSI frame can never interleave.
+ */
+#define CSI_FRAME_QUEUE_DEPTH 16
+
+#define CSI_FRAME_MAX_PAYLOAD ( \
+    sizeof(csi_binary_legacy_payload_t) > sizeof(csi_binary_c5c6_payload_t) \
+        ? sizeof(csi_binary_legacy_payload_t) \
+        : sizeof(csi_binary_c5c6_payload_t))
+#define CSI_FRAME_MAX_BYTES (sizeof(csi_binary_header_t) + CSI_FRAME_MAX_PAYLOAD)
+
+typedef struct {
+    uint16_t len;
+    uint8_t data[CSI_FRAME_MAX_BYTES];
+} csi_frame_msg_t;
+
+static QueueHandle_t s_csi_frame_queue;
+static SemaphoreHandle_t s_stdout_mutex;
+static uint32_t s_csi_frame_seq;
+static uint32_t s_csi_frame_dropped;
+
+static uint16_t crc16_xmodem(const uint8_t *data, size_t len)
+{
+    uint16_t crc = 0x0000;
+    for (size_t i = 0; i < len; i++) {
+        crc ^= (uint16_t)data[i] << 8;
+        for (int bit = 0; bit < 8; bit++) {
+            crc = (crc & 0x8000) ? (uint16_t)((crc << 1) ^ 0x1021) : (uint16_t)(crc << 1);
+        }
+    }
+    return crc;
+}
+
+/* Installed via esp_log_set_vprintf() so ESP_LOG* output takes the same
+ * mutex as the CSI writer task before touching stdout. */
+static int csi_console_vprintf(const char *fmt, va_list args)
+{
+    xSemaphoreTake(s_stdout_mutex, portMAX_DELAY);
+    int ret = vprintf(fmt, args);
+    xSemaphoreGive(s_stdout_mutex);
+    return ret;
+}
+
+static uint32_t s_csi_frame_truncated;
+
+/* Diagnostic only (2026-07-30): live testing showed a high CRC-fail rate on
+ * the PC side even with the queue+mutex fix in place, and the queue's own
+ * drop counter never fires — meaning loss is happening downstream of the
+ * queue. This surfaces whether write() itself is silently returning fewer
+ * bytes than requested (which would corrupt framing for this frame *and*
+ * misalign the next one) so that failure mode isn't as invisible as v1's
+ * total lack of any check. */
 static ssize_t csi_binary_write(const void *data, size_t len)
 {
     const uint8_t *bytes = data;
     size_t written = 0;
 
     while (written < len) {
+        errno = 0;
         ssize_t n = write(STDOUT_FILENO, bytes + written, len - written);
         if (n <= 0) {
+            s_csi_frame_truncated++;
+            static int64_t s_last_trunc_report_us;
+            int64_t now_us = esp_timer_get_time();
+            if (now_us - s_last_trunc_report_us > 1000000) {
+                ESP_LOGE(TAG, "short write: wrote %u/%u bytes, errno=%d - truncated %" PRIu32 " frame(s) so far",
+                         (unsigned)written, (unsigned)len, errno, s_csi_frame_truncated);
+                s_last_trunc_report_us = now_us;
+            }
             break;
         }
         written += n;
@@ -162,13 +246,50 @@ static ssize_t csi_binary_write(const void *data, size_t len)
     return written;
 }
 
+static void csi_uart_writer_task(void *arg)
+{
+    csi_frame_msg_t msg;
+    for (;;) {
+        if (xQueueReceive(s_csi_frame_queue, &msg, portMAX_DELAY) == pdTRUE) {
+            xSemaphoreTake(s_stdout_mutex, portMAX_DELAY);
+            csi_binary_write(msg.data, msg.len);
+            xSemaphoreGive(s_stdout_mutex);
+        }
+    }
+}
+
+/*
+ * Called only from wifi_csi_rx_cb (WiFi task context) — must never block.
+ * `msg` is `static`, not a stack local: this is called with an ~805-byte
+ * csi_binary_legacy_payload_t already live in the caller's frame, and
+ * xQueueSend() copies its argument synchronously (the CSI callback is never
+ * reentered concurrently with itself), so reusing one scratch buffer across
+ * calls is safe and avoids piling another ~820 bytes onto whatever WiFi/MAC
+ * task stack this callback runs on.
+ */
+static void csi_frame_enqueue(const void *header, size_t header_len, const void *payload, size_t payload_len)
+{
+    static csi_frame_msg_t msg;
+    if (header_len + payload_len > sizeof(msg.data)) {
+        return; /* cannot happen: sized from the same structs at compile time */
+    }
+    memcpy(msg.data, header, header_len);
+    memcpy(msg.data + header_len, payload, payload_len);
+    msg.len = (uint16_t)(header_len + payload_len);
+
+    if (xQueueSend(s_csi_frame_queue, &msg, 0) != pdTRUE) {
+        s_csi_frame_dropped++;
+        static int64_t s_last_report_us;
+        int64_t now_us = esp_timer_get_time();
+        if (now_us - s_last_report_us > 1000000) {
+            ESP_LOGE(TAG, "CSI frame queue full - dropped %" PRIu32 " frame(s) so far", s_csi_frame_dropped);
+            s_last_report_us = now_us;
+        }
+    }
+}
+
 static void csi_binary_send_legacy(uint32_t rx_id, wifi_csi_info_t *info, const wifi_pkt_rx_ctrl_t *rx_ctrl, float compensate_gain)
 {
-    csi_binary_header_t hdr = {
-        .magic = CSI_BINARY_MAGIC,
-        .version = CSI_BINARY_VERSION,
-        .layout = CSI_BINARY_LAYOUT_LEGACY,
-    };
     csi_binary_legacy_payload_t payload = {0};
 
     payload.id = rx_id;
@@ -206,19 +327,22 @@ static void csi_binary_send_legacy(uint32_t rx_id, wifi_csi_info_t *info, const 
         payload.csi[i] = (int16_t)(compensate_gain * info->buf[i]);
     }
 
-    csi_binary_write(&hdr, sizeof(hdr));
-    csi_binary_write(&payload, sizeof(payload));
+    csi_binary_header_t hdr = {
+        .magic = CSI_BINARY_MAGIC,
+        .version = CSI_BINARY_VERSION,
+        .layout = CSI_BINARY_LAYOUT_LEGACY,
+        .seq = s_csi_frame_seq++,
+        .payload_len = (uint16_t)sizeof(payload),
+        .payload_crc16 = crc16_xmodem((const uint8_t *)&payload, sizeof(payload)),
+    };
+
+    csi_frame_enqueue(&hdr, sizeof(hdr), &payload, sizeof(payload));
 }
 
 #if CONFIG_IDF_TARGET_ESP32C5 || CONFIG_IDF_TARGET_ESP32C6 || CONFIG_IDF_TARGET_ESP32C61
 static void csi_binary_send_c5c6(uint32_t rx_id, wifi_csi_info_t *info, const wifi_pkt_rx_ctrl_t *rx_ctrl,
                                  int8_t fft_gain, int8_t agc_gain, float compensate_gain)
 {
-    csi_binary_header_t hdr = {
-        .magic = CSI_BINARY_MAGIC,
-        .version = CSI_BINARY_VERSION,
-        .layout = CSI_BINARY_LAYOUT_C5C6,
-    };
     csi_binary_c5c6_payload_t payload = {0};
 
     payload.id = rx_id;
@@ -258,8 +382,16 @@ static void csi_binary_send_c5c6(uint32_t rx_id, wifi_csi_info_t *info, const wi
     }
 #endif
 
-    csi_binary_write(&hdr, sizeof(hdr));
-    csi_binary_write(&payload, sizeof(payload));
+    csi_binary_header_t hdr = {
+        .magic = CSI_BINARY_MAGIC,
+        .version = CSI_BINARY_VERSION,
+        .layout = CSI_BINARY_LAYOUT_C5C6,
+        .seq = s_csi_frame_seq++,
+        .payload_len = (uint16_t)sizeof(payload),
+        .payload_crc16 = crc16_xmodem((const uint8_t *)&payload, sizeof(payload)),
+    };
+
+    csi_frame_enqueue(&hdr, sizeof(hdr), &payload, sizeof(payload));
 }
 #endif
 
@@ -393,6 +525,32 @@ static void on_class_changed(wisense_class_t new_class, void *ctx)
 void app_main()
 {
     setvbuf(stdout, NULL, _IONBF, 0);
+
+    /*
+     * CRITICAL: the console driver's default TX line-ending mode
+     * (ESP_LINE_ENDINGS_CRLF) inserts an extra 0x0D byte before every 0x0A
+     * byte it writes — meant for human-readable log output, but it mangles
+     * raw binary data whenever a byte happens to equal 0x0A. This was the
+     * actual root cause of the CSI frame "loss" this session's live testing
+     * found (confirmed via raw byte capture: header-valid frames' sequence
+     * numbers were perfectly consecutive with zero gaps, but the on-wire
+     * byte spacing between them was 818-819 bytes instead of the protocol's
+     * fixed 817 — i.e. every frame really was arriving, just with 1-2 stray
+     * bytes inserted, which desynced the fixed-size framing and failed
+     * CRC). Must be set before the first CSI frame is ever written.
+     */
+    usb_serial_jtag_vfs_set_tx_line_endings(ESP_LINE_ENDINGS_LF);
+
+    /*
+     * Must be set up before anything logs: serializes every ESP_LOG* call
+     * against the CSI writer task's raw stdout writes, and gives the CSI
+     * callback a non-blocking queue instead of writing to the console
+     * directly. See the comment above csi_frame_enqueue().
+     */
+    s_stdout_mutex = xSemaphoreCreateMutex();
+    esp_log_set_vprintf(csi_console_vprintf);
+    s_csi_frame_queue = xQueueCreate(CSI_FRAME_QUEUE_DEPTH, sizeof(csi_frame_msg_t));
+    xTaskCreate(csi_uart_writer_task, "csi_uart_tx", 4096, NULL, tskIDLE_PRIORITY + 3, NULL);
 
     /**
      * @brief Initialize NVS

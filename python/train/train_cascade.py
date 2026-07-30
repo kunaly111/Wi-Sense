@@ -7,6 +7,7 @@ fall recording as a fall: only windows with y_fall=1 are fall positives.
 """
 
 import argparse
+import csv
 import json
 import sys
 from pathlib import Path
@@ -32,8 +33,34 @@ def load_npz(path):
         return {
             'X_feat': data['X_feat'].astype(np.float32),
             'class_id': data['class_id'].astype(np.int8),
+            'file_id': data['file_id'].astype(np.int32),
             **{target: data[target].astype(np.int8) for _, target, _ in STAGES},
         }
+
+
+def fall_file_ids_matching(manifest_path, pattern):
+    """file_ids of fall recordings matching every comma-separated token.
+
+    Tokens are matched (case-insensitively) against the recording's filename
+    and its baseline_source, so a scenario and a session can be combined —
+    e.g. "fall_bed_edge,session:2026-07-30" selects only the bed-edge captures
+    baselined against that day's empty-room reference. This keeps the stage
+    from learning across recordings baselined against different references,
+    which puts the same physical event in two different feature spaces.
+    """
+    tokens = [t.strip().lower() for t in pattern.split(',') if t.strip()]
+    ids = set()
+    with Path(manifest_path).open(newline='', encoding='utf-8', errors='replace') as handle:
+        for row in csv.DictReader(handle):
+            if row.get('label') != 'fall':
+                continue
+            haystack = f"{row.get('file', '')} {row.get('baseline_source', '')}".lower()
+            if all(token in haystack for token in tokens):
+                try:
+                    ids.add(int(row['file_id']))
+                except (KeyError, TypeError, ValueError):
+                    continue
+    return ids
 
 
 def balanced_sample_weight(y):
@@ -91,6 +118,17 @@ def main():
         '--fall-training', choices=('fall-only', 'all'), default='fall-only',
         help='fall-only learns the timed event from fall recordings; all uses every non-fall window',
     )
+    parser.add_argument(
+        '--fall-file-filter', default='',
+        help='Restrict the fall stage to fall recordings whose filename contains this '
+             'substring (e.g. "fall_bed_edge"). Use when fall captures span sessions '
+             'baselined against different empty-room references, which mixes feature '
+             'spaces and degrades the stage. Requires --manifest.',
+    )
+    parser.add_argument(
+        '--manifest', default='data/dataset/processed/preprocess_manifest.csv',
+        help='Preprocess manifest, used to resolve --fall-file-filter to file_ids',
+    )
     args = parser.parse_args()
 
     train_path, val_path = Path(args.train), Path(args.val)
@@ -103,16 +141,49 @@ def main():
     val = load_npz(val_path)
     print(f"Windows: train={len(train['X_feat'])}, val={len(val['X_feat'])}")
 
+    fall_keep_ids = None
+    if args.fall_file_filter:
+        fall_keep_ids = fall_file_ids_matching(args.manifest, args.fall_file_filter)
+        if not fall_keep_ids:
+            raise ValueError(
+                f'--fall-file-filter {args.fall_file_filter!r} matched no fall files '
+                f'in {args.manifest}'
+            )
+        print(f'Fall stage restricted to {len(fall_keep_ids)} recordings '
+              f'matching {args.fall_file_filter!r}')
+
     models, thresholds, report = {}, {}, {}
     for name, target, objective in STAGES:
         X_train, y_train = train['X_feat'], train[target]
-        if name == 'fall' and args.fall_training == 'fall-only':
-            # Fall manifests define the event at 8.5-11.5 s.  Training against
-            # pre/post-event windows from the same capture removes background,
-            # placement, and subject shortcuts while preserving the impact cue.
-            fall_files = train['class_id'] == 3
-            X_train, y_train = X_train[fall_files], y_train[fall_files]
-        y_val = val[target]
+        if name == 'fall':
+            if args.fall_training == 'fall-only':
+                # Fall manifests define the event at 8.5-11.5 s.  Training against
+                # pre/post-event windows from the same capture removes background,
+                # placement, and subject shortcuts while preserving the impact cue.
+                keep = train['class_id'] == 3
+                if fall_keep_ids is not None:
+                    keep &= np.isin(train['file_id'], list(fall_keep_ids))
+            else:
+                # 'all': every non-fall window is a negative.  The cascade tests
+                # fall FIRST, so this stage has to reject ordinary standing and
+                # walking too — with fall-only negatives it never sees them and
+                # scores them as falls.
+                keep = np.ones(len(y_train), dtype=bool)
+            if fall_keep_ids is not None:
+                # Never let a fall recording outside the selection act as a
+                # positive; drop those recordings entirely.
+                keep &= ~((train['class_id'] == 3)
+                          & ~np.isin(train['file_id'], list(fall_keep_ids)))
+            X_train, y_train = X_train[keep], y_train[keep]
+        # Keep every non-fall window as a negative, but drop fall recordings the
+        # stage no longer trains on — otherwise the threshold is tuned against
+        # events from a different baseline era than the model ever saw.
+        val_mask = np.ones(len(val['X_feat']), dtype=bool)
+        if name == 'fall' and fall_keep_ids is not None:
+            val_mask = (val['class_id'] != 3) | np.isin(val['file_id'], list(fall_keep_ids))
+        X_val = val['X_feat'][val_mask]
+        y_val = val[target][val_mask]
+        val_class_id = val['class_id'][val_mask]
         print(f'\nTraining {name}: train positives={int(y_train.sum())}, '
               f'val positives={int(y_val.sum())}, train windows={len(y_train)}', flush=True)
         model = HistGradientBoostingClassifier(
@@ -126,7 +197,7 @@ def main():
             random_state=args.seed,
         )
         model.fit(X_train, y_train, sample_weight=balanced_sample_weight(y_train))
-        probability = model.predict_proba(val['X_feat'])[:, 1]
+        probability = model.predict_proba(X_val)[:, 1]
         threshold, objective_score = best_threshold(y_val, probability, objective)
         models[name] = model
         thresholds[name] = threshold
@@ -134,7 +205,7 @@ def main():
         report[name]['selection_objective'] = objective
         report[name]['selection_score'] = round(objective_score, 4)
         if name == 'fall':
-            nonfall_files = val['class_id'] != 3
+            nonfall_files = val_class_id != 3
             report[name]['training_mode'] = args.fall_training
             report[name]['false_positive_rate_nonfall_files'] = round(
                 false_positive_rate(

@@ -30,6 +30,7 @@ from proto.csi_binary_proto import (
     CSI_BINARY_VERSION,
     DATA_COLUMNS_NAMES,
     DATA_COLUMNS_NAMES_C5C6,
+    crc16_xmodem,
 )
 
 EXPECTED_LEN_HT40 = 384
@@ -158,12 +159,13 @@ def _mac_bytes(mac_str):
     return bytes(int(part, 16) for part in mac_str.split(':'))
 
 
-# Byte offsets from start of full frame (header + payload).
+# Byte offsets from start of full frame (header + payload). +1 vs. the
+# pre-v2 offsets below sig_len because sig_len widened uint8_t -> uint16_t.
 _LEGACY_MAC_OFF = CSI_BINARY_HEADER.size + 4
-_LEGACY_LEN_OFF = CSI_BINARY_HEADER.size + 32
+_LEGACY_LEN_OFF = CSI_BINARY_HEADER.size + 33
 _LEGACY_CHANNEL_OFF = CSI_BINARY_HEADER.size + 23
 _C5C6_MAC_OFF = CSI_BINARY_HEADER.size + 4
-_C5C6_LEN_OFF = CSI_BINARY_HEADER.size + 22
+_C5C6_LEN_OFF = CSI_BINARY_HEADER.size + 23
 
 
 class BinaryStreamParser:
@@ -190,7 +192,7 @@ class BinaryStreamParser:
         if len(self._buf) < frame_size:
             return 'need_more'
 
-        magic, version, layout = CSI_BINARY_HEADER.unpack_from(self._buf, 0)
+        magic, version, layout, _seq, payload_len, payload_crc16 = CSI_BINARY_HEADER.unpack_from(self._buf, 0)
         if magic != CSI_BINARY_MAGIC or version != CSI_BINARY_VERSION:
             return 'shift'
 
@@ -213,16 +215,30 @@ class BinaryStreamParser:
             if channel != self._expected_channel:
                 return 'shift'
 
+        # Cheap structural checks passed — now verify the payload wasn't
+        # corrupted in transit (the one thing v1 of this protocol couldn't
+        # detect at all).
+        payload = bytes(self._buf[CSI_BINARY_HEADER.size:frame_size])
+        if payload_len != len(payload) or crc16_xmodem(payload) != payload_crc16:
+            return 'shift'
+
         return spec
 
     def pop_frame(self):
+        """Returns ((columns, row, seq), discarded_bytes) or (None, discarded_bytes).
+
+        `seq` is the firmware's RX-local monotonic frame counter — use it to
+        detect frames lost between the CSI callback and the UART writer
+        (e.g. a full internal queue), distinct from TX->RX ESP-NOW loss
+        (tracked separately via the `id` payload field / CaptureValidator).
+        """
         discarded = bytearray()
 
         while True:
             if len(self._buf) < CSI_BINARY_HEADER.size:
                 return None, bytes(discarded)
 
-            magic, version, layout = CSI_BINARY_HEADER.unpack_from(self._buf, 0)
+            magic, version, layout, seq, _payload_len, _payload_crc16 = CSI_BINARY_HEADER.unpack_from(self._buf, 0)
             if magic == CSI_BINARY_MAGIC and version == CSI_BINARY_VERSION:
                 spec = self._frame_layout(layout)
                 if spec is not None:
@@ -243,7 +259,7 @@ class BinaryStreamParser:
                         del self._buf[:frame_size]
                         row, error = _row_from_payload(to_row, payload)
                         if row is not None:
-                            return (columns, row), bytes(discarded)
+                            return (columns, row, seq), bytes(discarded)
 
             discarded.append(self._buf[0])
             del self._buf[0:1]
@@ -281,6 +297,14 @@ class CaptureValidator:
         self.sequence_missing = 0
         self.sequence_reordered = 0
         self.sequence_resets = 0
+        # RX-local frame `seq` (v2 protocol) — tracks UART-side loss (e.g.
+        # firmware's internal queue was full), independent of `id`'s
+        # TX->RX ESP-NOW loss tracking above.
+        self.last_uart_seq = None
+        self.uart_seq_received = 0
+        self.uart_seq_missing = 0
+        self.uart_seq_reordered = 0
+        self.uart_seq_resets = 0
         self._counts = {
             'element number is not equal': 0,
             'data is incomplete': 0,
@@ -347,6 +371,25 @@ class CaptureValidator:
             self.first_len_printed = True
             print('csi_len:', csi_data_len)
 
+    def record_uart_seq(self, seq):
+        """Track every frame pop_frame() returns, valid or not — a gap here
+        means the firmware dropped a frame before it ever reached the UART
+        (e.g. its internal queue was full), so it can never appear at all."""
+        if self.last_uart_seq is not None:
+            delta = (seq - self.last_uart_seq) & 0xFFFFFFFF
+            if delta == 0 or delta > 0x7FFFFFFF:
+                if seq < 1000 and self.last_uart_seq >= 1000:
+                    self.uart_seq_resets += 1
+                    self.last_uart_seq = seq
+                else:
+                    self.uart_seq_reordered += 1
+            else:
+                self.uart_seq_missing += delta - 1
+                self.last_uart_seq = seq
+        else:
+            self.last_uart_seq = seq
+        self.uart_seq_received += 1
+
     def record_bad(self, reason):
         self.rejected += 1
         if reason in self._counts:
@@ -380,12 +423,18 @@ class CaptureValidator:
         else:
             health = 'BAD - mixed CSI lengths, check parser/firmware'
 
+        uart_expected = self.uart_seq_received + self.uart_seq_missing
+        uart_loss_pct = (
+            100.0 * self.uart_seq_missing / uart_expected if uart_expected else 0.0
+        )
+
         return (
             f'packets: {packets_seen} | saved: {self.saved} | rejected: {self.rejected} '
             f'({reject_pct:.2f}%) | len={self.expected_len or "any"}: {self.len_ok} ({ok_pct:.1f}%) | '
             f'rate: {rate:.1f} Hz | tx_missing: {self.sequence_missing}/{sequence_expected} '
             f'({sequence_loss_pct:.2f}%) | reordered: {self.sequence_reordered} | '
             f'tx_resets: {self.sequence_resets} | '
+            f'uart_missing: {self.uart_seq_missing}/{uart_expected} ({uart_loss_pct:.2f}%) | '
             f'resync_bytes: {sync_shifts} | STATUS: {health}'
         )
 
@@ -403,6 +452,15 @@ class CaptureValidator:
             f'({sequence_loss_pct:.2f}%), reordered/duplicate: {self.sequence_reordered}, '
             f'tx resets: {self.sequence_resets}'
         )
+        uart_expected = self.uart_seq_received + self.uart_seq_missing
+        uart_loss_pct = (
+            100.0 * self.uart_seq_missing / uart_expected if uart_expected else 0.0
+        )
+        print(
+            f'uart (firmware-internal) frame loss: {self.uart_seq_missing}/{uart_expected} '
+            f'({uart_loss_pct:.2f}%), reordered/duplicate: {self.uart_seq_reordered}, '
+            f'resets: {self.uart_seq_resets}'
+        )
         for reason, count in self._counts.items():
             if count:
                 print(f'  {reason}: {count}')
@@ -417,10 +475,37 @@ class CaptureValidator:
         else:
             print('RESULT: BAD - CSI arrays were not captured correctly')
 
+    def stats_dict(self):
+        """Transport-quality counters for callers to persist (e.g. into a
+        collect_*.py manifest row) — same figures as status_line()/summary(),
+        structured instead of printed."""
+        sequence_expected = self.sequence_received + self.sequence_missing
+        tx_missing_pct = (
+            100.0 * self.sequence_missing / sequence_expected if sequence_expected else 0.0
+        )
+        uart_expected = self.uart_seq_received + self.uart_seq_missing
+        uart_missing_pct = (
+            100.0 * self.uart_seq_missing / uart_expected if uart_expected else 0.0
+        )
+        return {
+            'saved': self.saved,
+            'rejected': self.rejected,
+            'tx_missing': self.sequence_missing,
+            'tx_expected': sequence_expected,
+            'tx_missing_pct': round(tx_missing_pct, 2),
+            'tx_reordered': self.sequence_reordered,
+            'tx_resets': self.sequence_resets,
+            'uart_missing': self.uart_seq_missing,
+            'uart_expected': uart_expected,
+            'uart_missing_pct': round(uart_missing_pct, 2),
+            'uart_reordered': self.uart_seq_reordered,
+            'uart_resets': self.uart_seq_resets,
+        }
+
 
 def capture_binary_csi(port, baudrate, csv_writer, log_file_fd, csv_file=None,
                        expected_mac='1a:00:00:00:00:00', expected_len=EXPECTED_LEN_HT40,
-                       report_interval=2.0, duration_sec=None):
+                       report_interval=2.0, duration_sec=None, stats_out=None):
     parser = BinaryStreamParser(expected_mac=expected_mac, expected_len=expected_len)
     validator = CaptureValidator(expected_mac=expected_mac, expected_len=expected_len)
     ser = serial.Serial(port=port, baudrate=baudrate, bytesize=8, parity='N', stopbits=1, timeout=0.1)
@@ -467,7 +552,8 @@ def capture_binary_csi(port, baudrate, csv_writer, log_file_fd, csv_file=None,
                     break
 
                 packets_seen += 1
-                columns, row = frame
+                columns, row, seq = frame
+                validator.record_uart_seq(seq)
                 ok, reason, detail_a, detail_b = validator.validate(columns, row)
                 if not ok:
                     validator.record_bad(reason)
@@ -508,6 +594,14 @@ def capture_binary_csi(port, baudrate, csv_writer, log_file_fd, csv_file=None,
         if parser.sync_shifts:
             print(f'resync_bytes: {parser.sync_shifts}')
         ser.close()
+        if stats_out:
+            stats = validator.stats_dict()
+            stats['packets_seen'] = packets_seen
+            stats['resync_bytes'] = parser.sync_shifts
+            try:
+                Path(stats_out).write_text(json.dumps(stats, indent=2))
+            except OSError as exc:
+                print(f'warning: could not write stats file {stats_out}: {exc}')
     reject_ratio = validator.rejected / max(1, packets_seen)
     return 0 if validator.saved and reject_ratio < 0.005 else 1
 
@@ -527,6 +621,10 @@ def main():
                         help='Seconds between capture health reports')
     parser.add_argument('--duration', type=float, default=None,
                         help='Stop capture automatically after N seconds')
+    parser.add_argument('--stats-out', default='',
+                        help='Write final capture-quality stats (resync/tx-missing/'
+                             'uart-missing counters) as JSON to this path, for a '
+                             'caller (e.g. collect_*.py) to read back and persist')
 
     args = parser.parse_args()
     expected_len = args.expected_len if args.expected_len > 0 else None
@@ -547,6 +645,7 @@ def main():
             expected_len=expected_len,
             report_interval=args.report_interval,
             duration_sec=args.duration,
+            stats_out=args.stats_out or None,
         )
 
 

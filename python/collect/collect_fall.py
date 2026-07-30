@@ -6,6 +6,7 @@
 import argparse
 import csv
 import datetime as dt
+import json
 import re
 import subprocess
 import sys
@@ -17,9 +18,13 @@ if str(_PYTHON_ROOT) not in sys.path:
     sys.path.insert(0, str(_PYTHON_ROOT))
 
 from paths import CAPTURE_SCRIPT, PYTHON_ROOT, RAW_ROOT
+from collect.validate_csi_captures import audit_file
 
 DEFAULT_FALL_DATASET_ROOT = RAW_ROOT / 'fall_v2'
 DATASET_ROOT = DEFAULT_FALL_DATASET_ROOT  # overridden by --dataset-root in main()
+# Fall reps are ~30s (1/4 of presence/motion's 120s window); scale the
+# minimum raw-packet floor proportionally rather than reusing the 120s value.
+DEFAULT_MIN_CAPTURE_PACKETS = 500
 
 VALID_SCENARIOS = (
     'fall_center',
@@ -127,7 +132,7 @@ def wait_until(start_time, target_elapsed):
 
 def append_manifest(manifest_path, row):
     write_header = not manifest_path.exists()
-    with manifest_path.open('a', newline='') as handle:
+    with manifest_path.open('a', newline='', encoding='utf-8') as handle:
         writer = csv.DictWriter(handle, fieldnames=row.keys())
         if write_header:
             writer.writeheader()
@@ -157,6 +162,29 @@ def rest_countdown(seconds):
     print(' ' * 40, end='\r', flush=True)
 
 
+def stats_path_for(csv_path):
+    return csv_path.with_suffix('.stats.json')
+
+
+def read_stats_json(stats_path):
+    """Read the transport-quality stats capture_csi_binary.py writes via
+    --stats-out (resync/tx-missing/uart-missing counters). Returns {} if the
+    capture failed before writing it or used an older script version."""
+    if not stats_path.exists():
+        return {}
+    try:
+        return json.loads(stats_path.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def audit_capture(csv_path, min_raw_packets=DEFAULT_MIN_CAPTURE_PACKETS):
+    """Preprocessing-level quality check (drop_pct/kept_packets/status) —
+    same logic collect_empty_room.py already uses. Recorded in the manifest
+    only, not acted on: no auto-quarantine here."""
+    return audit_file(csv_path, min_raw=min_raw_packets)
+
+
 def start_capture_process(port, baud, csv_path, log_path, duration_sec, expected_len, expected_mac):
     cmd = [
         sys.executable,
@@ -169,6 +197,7 @@ def start_capture_process(port, baud, csv_path, log_path, duration_sec, expected
         '--expected-mac', expected_mac,
         '--report-interval', '15',
         '--duration', str(duration_sec),
+        '--stats-out', str(stats_path_for(csv_path)),
     ]
     print(f'  running capture for {duration_sec}s')
     return subprocess.Popen(cmd, cwd=str(PYTHON_ROOT))
@@ -208,7 +237,8 @@ def run_capture_with_fall_cue(
 
     exit_code = proc.wait()
     beep_record_end()
-    return exit_code, window_start
+    capture_stats = read_stats_json(stats_path_for(csv_path))
+    return exit_code, window_start, capture_stats
 
 
 def run_scenario_session(
@@ -229,6 +259,7 @@ def run_scenario_session(
     start_serial=0,
     scenario_label='',
     prompt_each_rep=False,
+    environment_notes='',
 ):
     scenario = normalize_scenario(scenario)
     if scenario not in SCENARIO_META:
@@ -260,13 +291,15 @@ def run_scenario_session(
     print('Beeps: 2 = recording ON | 3 = FALL NOW | 1 = recording OFF')
     print()
 
-    with session_log.open('w') as log_handle:
+    with session_log.open('w', encoding='utf-8') as log_handle:
         log_handle.write(f'label=fall\nscenario={scenario}\nmark={mark}\n')
         log_handle.write(f'instruction={instruction}\n')
         log_handle.write(f'fall_offset_sec={fall_offset_sec}\n')
         log_handle.write(f'fall_window_sec={fall_window_sec}\n')
         if scenario_label:
             log_handle.write(f'scenario_label={scenario_label}\n')
+        if environment_notes:
+            log_handle.write(f'environment_notes={environment_notes}\n')
         log_handle.write(f'started={dt.datetime.now().isoformat()}\n')
         log_handle.write(f'reps={total_reps}\n')
 
@@ -290,7 +323,7 @@ def run_scenario_session(
             log_handle.write(f'rep={rep_idx} file={csv_name} start={dt.datetime.now().isoformat()}\n')
             log_handle.flush()
 
-            exit_code, window_start = run_capture_with_fall_cue(
+            exit_code, window_start, capture_stats = run_capture_with_fall_cue(
                 port,
                 baud,
                 csv_path,
@@ -302,6 +335,7 @@ def run_scenario_session(
                 fall_countdown_sec=fall_countdown_sec,
             )
             packet_count = count_data_rows(csv_path)
+            quality = audit_capture(csv_path)
 
             append_manifest(manifest_path, {
                 'rep': rep_idx,
@@ -314,10 +348,19 @@ def run_scenario_session(
                 'instruction': instruction,
                 'fall_offset_sec': fall_offset_sec,
                 'fall_window_sec': fall_window_sec,
+                'environment_notes': environment_notes,
                 'started_at': dt.datetime.fromtimestamp(window_start).isoformat(timespec='seconds'),
                 'duration_sec': duration_sec,
                 'packets': packet_count,
                 'capture_exit_code': exit_code,
+                'quality': quality['status'],
+                'drop_pct': quality.get('drop_pct', 0.0),
+                'kept_packets': quality.get('kept_packets', packet_count),
+                'resync_bytes': capture_stats.get('resync_bytes', ''),
+                'tx_missing_pct': capture_stats.get('tx_missing_pct', ''),
+                'tx_resets': capture_stats.get('tx_resets', ''),
+                'uart_missing_pct': capture_stats.get('uart_missing_pct', ''),
+                'uart_resets': capture_stats.get('uart_resets', ''),
             })
 
             print(f'  saved {packet_count} packets -> {csv_path.name}')
@@ -367,6 +410,10 @@ def main():
     parser.add_argument('--expected-mac', default='1a:00:00:00:00:00', help='TX MAC address')
     parser.add_argument('--start-serial', type=int, default=0,
                         help='Force first serial number (0 = auto)')
+    parser.add_argument('--environment-notes', default='',
+                        help='Free-text note on physical room state for this session '
+                             '(e.g. "bag near TX removed") — recorded in the manifest '
+                             'and session log since it cannot be reconstructed later.')
     args = parser.parse_args()
 
     scenario = normalize_scenario(args.scenario)
@@ -406,6 +453,7 @@ def main():
         expected_len=args.expected_len,
         expected_mac=args.expected_mac,
         start_serial=args.start_serial,
+        environment_notes=args.environment_notes,
     )
     return 0
 

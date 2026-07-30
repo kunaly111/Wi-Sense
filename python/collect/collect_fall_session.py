@@ -104,6 +104,10 @@ def main():
         default='',
         help='Fall dataset root (default: data/raw/fall_v2).',
     )
+    parser.add_argument('--environment-notes', default='',
+                        help='Free-text note on physical room state for this session '
+                             '(e.g. "bag near TX removed") — recorded in every scenario\'s '
+                             'manifest and the master session log.')
     args = parser.parse_args()
 
     dataset_root = Path(args.dataset_root) if args.dataset_root else DEFAULT_FALL_DATASET_ROOT
@@ -158,6 +162,8 @@ def main():
         master_handle.write(f'started={dt.datetime.now().isoformat()}\n')
         master_handle.write(f'start_scenario={start_scenario}\n')
         master_handle.write(f'fall_offset_sec={args.fall_offset_sec}\n')
+        if args.environment_notes:
+            master_handle.write(f'environment_notes={args.environment_notes}\n')
 
         for scenario_idx in range(start_scenario - 1, len(FALL_SCENARIOS)):
             scenario, scenario_label, reps = FALL_SCENARIOS[scenario_idx]
@@ -197,6 +203,7 @@ def main():
                 expected_len=args.expected_len,
                 expected_mac=args.expected_mac,
                 scenario_label=scenario_label,
+                environment_notes=args.environment_notes,
             )
 
             master_handle.write(

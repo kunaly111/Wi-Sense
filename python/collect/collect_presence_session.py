@@ -92,6 +92,10 @@ def main():
                         help='Start at position slug, e.g. door_corner')
     parser.add_argument('--resume', action='store_true',
                         help='Auto-start at first spot with fewer than 8 CSV files')
+    parser.add_argument('--environment-notes', default='',
+                        help='Free-text note on physical room state for this session '
+                             '(e.g. "bag near TX removed") — recorded in every spot\'s '
+                             'manifest and the master session log.')
     args = parser.parse_args()
 
     start_spot = resolve_start_spot(args)
@@ -132,6 +136,8 @@ def main():
     with master_log.open('w') as master_handle:
         master_handle.write(f'started={dt.datetime.now().isoformat()}\n')
         master_handle.write(f'start_spot={start_spot}\n')
+        if args.environment_notes:
+            master_handle.write(f'environment_notes={args.environment_notes}\n')
 
         for spot_idx in range(start_spot - 1, len(PRESENCE_SPOTS)):
             position, label, posture = PRESENCE_SPOTS[spot_idx]
@@ -158,6 +164,7 @@ def main():
                 expected_mac=args.expected_mac,
                 spot_label=label,
                 ready_sec=args.move_sec,
+                environment_notes=args.environment_notes,
             )
 
             master_handle.write(
